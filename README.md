@@ -1,7 +1,11 @@
-# The Same Agent, Four Ways
+# The Same Agent on LangGraph, Inngest, DBOS and Temporal
+
+> **Status: written from each vendor's documentation and not yet executed end to end.**
+> The API calls are verified against current docs. If a signature has drifted, open an
+> issue and it gets fixed the same week.
 
 One research agent, implemented on four durable execution layers, so you can run the one
-you picked and see what a crash actually costs you.
+you picked, kill it mid-run, and see which steps you pay for twice.
 
 The agent is the same in all four: search a query, summarize each page it finds, build an
 outline, publish. Forty-ish steps on a real corpus. The only thing that changes between
@@ -50,8 +54,3 @@ seconds and not at twelve is a boundary too coarse to have saved yet.
 | `dbos_impl` | Postgres | same |
 | `inngest_impl` | Inngest dev server | `npx inngest-cli@latest dev` |
 | `temporal_impl` | Temporal dev server | `temporal server start-dev` |
-
-## Status
-
-Written from each vendor's own documentation and not yet executed end to end. If a call
-signature has drifted, open an issue and it gets fixed the same week.
