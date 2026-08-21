@@ -1,0 +1,35 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Neither job installs requirements.txt. probe.py is stdlib-only by design,
+      # and the four implementations need Postgres, Temporal and an OpenAI key,
+      # so CI proves the measurement, never the SDKs. See requirements.txt.
+      - name: verdict assertions
+        run: python test_probe.py
+      - name: end-to-end self-test (durable / non-durable / coarse stand-ins)
+        run: python probe.py --self-test
+      - name: probe.py imports nothing outside the stdlib
+        run: |
+          python - <<'PY'
+          import ast, sys
+          tree = ast.parse(open("probe.py").read())
+          mods = set()
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Import):
+                  mods |= {a.name.split(".")[0] for a in n.names}
+              elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                  mods.add(n.module.split(".")[0])
+          extra = mods - set(sys.stdlib_module_names)
+          print("imports:", sorted(mods))
+          assert not extra, f"probe.py grew a third-party import: {extra}"
+          PY
