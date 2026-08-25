@@ -35,16 +35,58 @@ README section below with the extra service it needs.
 
 ## Prove it survives
 
+Start here. It needs no API key, no Postgres and no docker:
+
 ```bash
-python probe.py --run "python -m langgraph_impl.main --query x" --kill-after 8
+python probe.py --self-test
 ```
 
-It starts the run, kills it mid-flight, restarts it, and names every step that executed
-twice. Exit 0 means nothing expensive ran again. Exit 1 names the boundaries you drew in
-the wrong place.
+Three stand-in agents, one durable, one with no durability, one wrapping everything in a
+single step. The probe has to separate all three or the self-test fails. That last case is
+the one worth understanding, because it is what this repo got wrong until 2026-08-21.
+
+Then against a real implementation:
+
+```bash
+python probe.py --run "python -m langgraph_impl.main --query x" --kill-after 8 \
+                --reset "docker compose exec -T postgres psql -U postgres -c 'truncate checkpoints'"
+```
+
+`--reset` is required against anything durable. The probe runs the work three times: once
+clean to learn what it costs, once killed mid-flight, once restarted. Without a reset
+between the first and second, the clean run leaves a finished checkpoint behind and the
+killed run resumes from it instantly.
+
+```
+  step            once  killed  restart  repaid
+  search             1       1        0      +0
+  summarize          11      4        7      +0
+  outline            1       0        1      +0
+  publish            1       0        1      +0
+```
+
+`repaid = (killed + restart) - once`. Anything above zero is work you bought twice.
+
+**The floor is one repaid step.** Whatever was in flight when the kill landed had already
+started and not yet checkpointed, so even a perfect system pays for it again. Exit 0 means
+the repaid set is exactly that one step. Exit 1 means something else was repaid too, or
+the boundary is so coarse the verdict stops meaning anything.
+
+That last clause is a real guard, not a caveat. Wrap the whole agent in one step and the
+kill lands inside it by definition, so "only the in-flight step was repaid" becomes
+trivially true for a system with no durability at all. The probe now refuses that: one
+step total, or one step swallowing more than half the pre-crash time, exits 1 and says
+COARSE.
 
 Run it three times with different `--kill-after` values. A step that re-executes at eight
 seconds and not at twelve is a boundary too coarse to have saved yet.
+
+### What is not measured here
+
+`probe.py --self-test` and `test_probe.py` run in CI on every push. The four
+implementations do not: they need Postgres, a Temporal server, an Inngest dev server and
+an OpenAI key. **No numbers from a real run are published in this repo yet.** When they
+are, they will name the SDK versions they came from.
 
 ## What each one needs
 

@@ -1,3 +1,7 @@
+# Everything the probe needs except an OpenAI key and the Inngest dev server
+# (that one is `npx inngest-cli@latest dev`, it has no image worth pinning).
+#
+#   docker compose up -d && ./run-demo.sh langgraph
 services:
   postgres:
     image: postgres:16
@@ -8,3 +12,29 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
+
+  # temporalio/auto-setup runs the server and creates the default namespace in one
+  # container. Fine for a demo, not for anything else.
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PWD: postgres
+      POSTGRES_SEEDS: postgres
+    ports: ["7233:7233"]
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "namespace", "describe", "default"]
+      interval: 5s
+      retries: 20
+
+  temporal-ui:
+    image: temporalio/ui:2.32.0
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["8233:8080"]

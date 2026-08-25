@@ -1,6 +1,18 @@
-langgraph>=0.2
-langgraph-checkpoint-postgres>=2.0
-dbos>=0.26
-temporalio>=1.7
-openai>=1.40
-httpx>=0.27
+# Pinned, not floored. A `>=` on four pre-1.0 SDKs reproduces the exact failure
+# self-host-boundaries' Boundary 2 exists to teach: two release calendars, one
+# import, no warning. Every version below was checked to exist on PyPI 2026-08-21.
+#
+# UNTESTED against a live install: the four implementations need Postgres, a
+# Temporal server and an OpenAI key, none of which CI has. `probe.py --self-test`
+# is what CI proves, and it imports none of these. Bump deliberately, run the
+# implementation you touched, and record the result in the README.
+#
+# All four are behind current HEAD on purpose. langgraph 1.0 moved the checkpoint
+# API these files are written against; dbos is at 2.30 and this code targets 0.x.
+# Upgrading is real work, not a version bump.
+langgraph==0.2.76
+langgraph-checkpoint-postgres==2.0.25
+dbos==0.26.0
+temporalio==1.9.0
+openai==1.59.6
+httpx==0.27.2
