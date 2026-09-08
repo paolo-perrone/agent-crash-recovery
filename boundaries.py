@@ -236,6 +236,21 @@ class FileScan:
             # Loop context per call site. An unprotected call inside `for p in pages`
             # is not repaid once, it is repaid once per page, and that multiplier is
             # the difference between a rounding error and the whole bill.
+            # Collection sizes the SOURCE can prove, so --fanout stops being a guess
+            # wherever the loop iterates a literal or a range (2026-09-08). Anything it
+            # cannot size still falls back to --fanout, and the report says which.
+            sized = {}
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                        and isinstance(node.targets[0], ast.Name):
+                    v = node.value
+                    if isinstance(v, (ast.List, ast.Tuple, ast.Set)):
+                        sized[node.targets[0].id] = len(v.elts)
+                    elif isinstance(v, ast.Call) and _dotted(v.func) == "range" \
+                            and len(v.args) == 1 and isinstance(v.args[0], ast.Constant) \
+                            and isinstance(v.args[0].value, int):
+                        sized[node.targets[0].id] = v.args[0].value
+
             loops = {}
             for node in ast.walk(fn):
                 it = None
@@ -249,10 +264,19 @@ class FileScan:
                 else:
                     continue
                 label = _dotted(it) or "the collection"
+                n = None
+                if isinstance(it, ast.Call) and _dotted(it.func) == "range" \
+                        and len(it.args) == 1 and isinstance(it.args[0], ast.Constant) \
+                        and isinstance(it.args[0].value, int):
+                    n = it.args[0].value
+                elif isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+                    n = len(it.elts)
+                elif isinstance(it, ast.Name):
+                    n = sized.get(it.id)
                 for b in body:
                     for inner in ast.walk(b):
                         if isinstance(inner, ast.Call):
-                            loops.setdefault(inner.lineno, label)
+                            loops.setdefault(inner.lineno, (label, n))
 
             crossed = set()
             for c in ast.walk(fn):
@@ -498,14 +522,16 @@ def check_python(paths, extra):
                         per = info["loops"].get(line)
                         findings.append({
                             "kind": "UNPROTECTED", "file": s.path, "line": line,
-                            "per": per, "callee": callee,
+                            "per": per[0] if per else None,
+                            "per_n": per[1] if per else None, "callee": callee,
                             "what": f"{name}() calls {raw}() with no boundary",
                             "why": f"{s.orchestrators[name]} replays from the top, so this "
                                    "is bought again on every retry"})
                 for d, line in info["spend"]:
                     findings.append({
                         "kind": "UNPROTECTED", "file": s.path, "line": line,
-                        "per": info["loops"].get(line),
+                        "per": (info["loops"].get(line) or (None, None))[0],
+                        "per_n": (info["loops"].get(line) or (None, None))[1],
                         "what": f"{name}() calls {d} directly",
                         "why": f"{s.orchestrators[name]} replays from the top, so this is "
                                "bought again on every retry"})
@@ -650,7 +676,11 @@ def bill(findings, cost, fanout):
     Both halves are printed, so nobody mistakes an assumption for a measurement."""
     fixed = [f for f in findings if f["kind"] == "UNPROTECTED" and not f.get("per")]
     looped = [f for f in findings if f["kind"] == "UNPROTECTED" and f.get("per")]
-    calls = len(fixed) + len(looped) * fanout
+    # A size the source proves beats a size the reader guessed. --fanout covers only
+    # the loops that cannot be sized, and the report says which is which (2026-09-08).
+    proven = [f for f in looped if f.get("per_n")]
+    guessed = [f for f in looped if not f.get("per_n")]
+    calls = len(fixed) + sum(f["per_n"] for f in proven) + len(guessed) * fanout
     def plural(n, w):
         return f"{n} {w}" + ("" if n == 1 else "s")
 
@@ -659,13 +689,16 @@ def bill(findings, cost, fanout):
 
     lines = []
     if looped:
-        terms = ", ".join(sorted({f"once per item in {f['per']}" for f in looped}))
+        terms = ", ".join(sorted(
+            {f"{f['per_n']} times, once per item in {f['per']}" if f.get("per_n")
+             else f"once per item in {f['per']}" for f in looped}))
         lines.append(f"  every retry repays {plural(len(fixed), 'fixed call')} plus {terms}.")
     elif fixed:
         lines.append(f"  every retry repays {plural(len(fixed), 'call')}.")
     if calls and cost is not None:
-        basis = (f"at {fanout} items per loop and {money(cost)} a call"
-                 if looped else f"at {money(cost)} a call")
+        basis = (f"at {money(cost)} a call" if not guessed
+                 else f"at {fanout} items for the loops it could not size and "
+                      f"{money(cost)} a call")
         lines.append(f"  {basis}, one crash repays {plural(calls, 'call')}, "
                      f"{money(calls * cost)}. A thousand crashes: "
                      f"{money(calls * cost * 1000)}.")
@@ -789,7 +822,9 @@ def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
         print(f"  {f['kind']:<12} {rel}:{f['line']}")
         print(f"               {f['what']}")
         if f.get("per"):
-            print(f"               repaid once per item in {f['per']}")
+            n = f.get("per_n")
+            print(f"               repaid {n} times, once per item in {f['per']}" if n
+                  else f"               repaid once per item in {f['per']}")
         print(f"               {f['why']}")
         print()
     bad = [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")]
@@ -845,6 +880,19 @@ def summarize_and_outline(pages):
 @DBOS.workflow()
 def research(pages):
     return summarize_and_outline(pages)
+'''
+
+SIZED = '''
+from dbos import DBOS
+from openai import OpenAI
+
+def summarize(page):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+
+@DBOS.workflow()
+def research(q):
+    pages = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    return [summarize(p) for p in pages]
 '''
 
 TEMPORAL_MANUAL = '''
@@ -995,6 +1043,21 @@ def self_test():
         ok &= good
         print(f"  {'ok  ' if good else 'FAIL'}  TS: a step.run label and a comment that both "
               f"contain `await x()` are ignored: {[x['what'] for x in f]}")
+
+        # a size the source proves is used instead of --fanout
+        p = os.path.join(d, "sized.py")
+        open(p, "w").write(textwrap.dedent(SIZED))
+        findings, _, _ = check_python([p], [])
+        ns = [f.get("per_n") for f in findings if f["kind"] == "UNPROTECTED"]
+        good = ns == [11]
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  a loop over an 11-element literal is priced "
+              f"at 11, not at --fanout: {ns}")
+        priced = bill(findings, 0.0004, 99)
+        good = any("11 calls" in l for l in priced) and not any("99" in l for l in priced)
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  --fanout is ignored where the size is proven: "
+              f"{priced[-1].strip() if priced else 'no bill'}")
 
         p = os.path.join(d, "case.ts")
         open(p, "w").write(textwrap.dedent(TS_CASE))

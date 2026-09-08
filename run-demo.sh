@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # One command from nothing to a repaid table.
 #
+#   ./run-demo.sh langgraph --offline    # no key, no spend, real durability
 #   export OPENAI_API_KEY=sk-...
-#   ./run-demo.sh langgraph        # or dbos | temporal | inngest
+#   ./run-demo.sh langgraph              # or dbos | temporal | inngest, with the bill
 #
 # Everything this needs that you do not have, it tells you about and stops.
 # It never invents a result and it never runs the probe against a stack that is
@@ -16,6 +17,7 @@
 set -euo pipefail
 IMPL="${1:-langgraph}"
 KILL_AFTER="${2:-8}"
+case "$KILL_AFTER" in --offline) KILL_AFTER=8;; esac
 PG="postgresql://postgres:postgres@localhost:5432/durable"
 PSQL="docker compose exec -T postgres psql -U postgres -d durable -q -c"
 
@@ -28,12 +30,24 @@ case "$IMPL" in
 esac
 
 echo "== preconditions"
-[ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is not set. The summarize step is a real
+# --offline runs the whole thing without a key: the model call becomes a sleep of the
+# same shape and everything that decides durability stays real. The repaid table comes
+# out identical; only the dollars are missing. Added 2026-09-08, because demanding a key
+# before a reader can see anything is the wrong first ask (see README, First real runs).
+if [ "${OFFLINE:-0}" = "1" ] || [ "${2:-}" = "--offline" ] || [ "${3:-}" = "--offline" ]; then
+  export PROBE_OFFLINE=1
+  echo "  .. offline mode: the model call is a sleep, so this costs nothing and proves"
+  echo "     durability rather than dollars. Drop --offline with a key set for the bill."
+else
+  [ -n "${OPENAI_API_KEY:-}" ] || die "OPENAI_API_KEY is not set. The summarize step is a real
   gpt-4o-mini call, which is the entire point: the bill is what a crash makes you pay twice.
-  One full run is about 13 calls at a few hundred tokens each."
+  One full run is about 13 calls at a few hundred tokens each.
+
+  No key handy? Run it for free:  ./run-demo.sh ${IMPL} --offline"
+fi
 have docker || die "docker is not installed. Every implementation needs Postgres."
 docker info >/dev/null 2>&1 || die "docker is installed but not running."
-echo "  ok  docker, OPENAI_API_KEY"
+echo "  ok  docker${OPENAI_API_KEY:+, OPENAI_API_KEY}${PROBE_OFFLINE:+, offline}"
 
 echo "== services"
 docker compose up -d postgres >/dev/null

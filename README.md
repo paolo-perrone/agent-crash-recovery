@@ -43,6 +43,12 @@ README section below with the extra service it needs.
 services, an API key and an afternoon. `boundaries.py` answers it by reading the code you
 already have, in a second, with nothing installed:
 
+**No key, no spend, still a real measurement.** `./run-demo.sh langgraph --offline` swaps
+the model call for a sleep of the same shape and leaves everything that decides durability
+real: real Postgres, real checkpoints, a real SIGKILL, a real resume. The repaid table comes
+out identical, and only the dollars are missing. Set `OPENAI_API_KEY` and drop the flag when
+you want the bill.
+
 Install it once and point it at any repo, no clone:
 
 ```bash
@@ -111,10 +117,10 @@ report. DBOS, Prefect, Celery and Airflow land in the first.
 python boundaries.py my_agent/ --cost 0.0004 --fanout 11
 ```
 
-A call inside `for page in pages` is not repaid once, it is repaid once per page, and the
-report says so with the name of the collection. `--cost` is the price of one model call and
-`--fanout` is how many items you expect in a loop the source cannot size, so both
-assumptions are yours and both are printed:
+A call inside `for page in pages` gets repaid once per page, and the report names the
+collection. Where the source proves the size, a literal list or a `range(11)`, it uses that
+number and ignores `--fanout` entirely. `--fanout` covers only the loops it cannot size, and
+the bill says which case you are in:
 
 ```
   every retry repays 0 fixed calls plus once per item in pages.
