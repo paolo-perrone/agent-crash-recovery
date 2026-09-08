@@ -2,3 +2,8 @@
 __pycache__/
 node_modules/
 *.pyc
+
+# packaging output
+build/
+dist/
+*.egg-info/

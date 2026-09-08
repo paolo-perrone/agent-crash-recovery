@@ -30,6 +30,10 @@ jobs:
           assert "inngest_impl/index.ts" in r.stdout, r.stdout
           print("ground truth held")
           PY
+      - name: boundaries installs as a command
+        run: |
+          pip install --quiet .
+          boundaries --self-test
       - name: every documented file exists
         run: |
           python - <<'PY'

@@ -43,8 +43,24 @@ README section below with the extra service it needs.
 services, an API key and an afternoon. `boundaries.py` answers it by reading the code you
 already have, in a second, with nothing installed:
 
+Install it once and point it at any repo, no clone:
+
 ```bash
-python boundaries.py path/to/your/agent/
+pipx install git+https://github.com/paolo-perrone/agent-crash-recovery
+boundaries path/to/your/agent/
+```
+
+or run it from this clone with `python boundaries.py path/to/your/agent/`. It is one
+stdlib-only file, so there is no resolver to fight with your own pins.
+
+As a pre-commit hook, which is the moment this is cheapest to fix:
+
+```yaml
+- repo: https://github.com/paolo-perrone/agent-crash-recovery
+  rev: main
+  hooks:
+    - id: boundaries
+      args: [--cost, "0.0004"]
 ```
 
 It finds every expensive call your orchestrator reaches and tells you which ones sit
@@ -65,6 +81,29 @@ configuration where reading your source proves nothing.
 Run it on this repo and it names the one deliberately unwrapped call in
 `inngest_impl/index.ts` and clears the LangGraph, DBOS and Temporal implementations, which
 is the ground truth CI asserts on every push.
+
+### It makes the edit, or says why it will not
+
+```bash
+boundaries my_agent/ --fix           # show the change
+boundaries my_agent/ --fix --write   # make it
+```
+
+Where a framework declares a boundary with a decorator, `--fix` writes the decorator above
+the function and the next run comes back clean. Where it does not, it prints the change and
+refuses to make it, with the reason:
+
+```
+  edits this refuses to make:
+
+  wf.py:11  run() calls outline() with no boundary
+      an @activity.defn decorator is half of it; the workflow must also call it
+      through workflow.execute_activity()
+```
+
+Temporal, LangGraph, Hatchet, Restate and Inngest all land in that second list, because
+each needs a call-site change and a half-correct edit to durability code is worse than a
+report. DBOS, Prefect, Celery and Airflow land in the first.
 
 ### It gives you the bill, not a count
 

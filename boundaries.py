@@ -116,7 +116,7 @@ class FileScan:
     """One Python file: its functions, what each calls, and which are boundaries."""
 
     def __init__(self, path, src, extra):
-        self.path, self.extra = path, extra
+        self.path, self.extra, self.src = path, extra, src
         self.tree = ast.parse(src, filename=path)
         self.frameworks = set()
         self.functions = {}        # name -> {"calls": [(callee, line)], "spend": [(dotted, line)], "node": fn}
@@ -359,7 +359,7 @@ def check_python(paths, extra):
                         per = info["loops"].get(line)
                         findings.append({
                             "kind": "UNPROTECTED", "file": s.path, "line": line,
-                            "per": per,
+                            "per": per, "callee": callee,
                             "what": f"{name}() calls {raw}() with no boundary",
                             "why": f"{s.orchestrators[name]} replays from the top, so this "
                                    "is bought again on every retry"})
@@ -370,7 +370,7 @@ def check_python(paths, extra):
                         "what": f"{name}() calls {d} directly",
                         "why": f"{s.orchestrators[name]} replays from the top, so this is "
                                "bought again on every retry"})
-    return findings, sorted({fw for s in scans for fw in s.frameworks})
+    return findings, sorted({fw for s in scans for fw in s.frameworks}), scans
 
 
 # --- TypeScript, by pattern and honest about it ------------------------------
@@ -453,6 +453,102 @@ def bill(findings, cost, fanout):
     return lines
 
 
+
+# --- --fix: the edit, not just the finding ------------------------------------
+# What each framework needs to protect a bare function, and whether a decorator
+# alone is enough. Where it is not, --fix prints the change and refuses to make
+# it, because a half-correct edit to durability code is worse than a report.
+FIXABLE = {
+    "dbos":    {"decorator": "@DBOS.step()", "import": ("dbos", "DBOS")},
+    "prefect": {"decorator": "@task", "import": ("prefect", "task")},
+    "celery":  {"decorator": "@shared_task", "import": ("celery", "shared_task")},
+    "airflow": {"decorator": "@task", "import": ("airflow.decorators", "task")},
+}
+MANUAL = {
+    "temporal": "an @activity.defn decorator is half of it; the workflow must also "
+                "call it through workflow.execute_activity()",
+    "langgraph": "a node is registered with add_node(), not declared with a decorator",
+    "hatchet": "steps are methods on the workflow class, so the fix is a move, not a "
+               "decorator",
+    "restate": "the call has to move inside ctx.run(), which is a call-site rewrite",
+    "inngest": "the call has to move inside step.run(), which is a call-site rewrite",
+}
+
+
+def _defining_file(name, scans):
+    for sc in scans:
+        if name in sc.functions:
+            return sc
+    return None
+
+
+def plan_fixes(findings, scans, frameworks):
+    """(edits, manual). An edit is (path, insert_line, text, why)."""
+    edits, manual = [], []
+    fw = next((f for f in frameworks if f in FIXABLE), None)
+    for f in findings:
+        if f["kind"] != "UNPROTECTED":
+            continue
+        target = f.get("callee")
+        if not target:
+            manual.append((f, "the call site names no function this could decorate"))
+            continue
+        if fw is None:
+            why = next((MANUAL[k] for k in frameworks if k in MANUAL),
+                       "no framework here declares boundaries with a decorator")
+            manual.append((f, why))
+            continue
+        sc = _defining_file(target, scans)
+        if sc is None:
+            manual.append((f, f"{target}() is defined outside the files this scan read"))
+            continue
+        spec = FIXABLE[fw]
+        mod, sym = spec["import"]
+        has_import = any(sym == local or sym == orig
+                         for local, orig in sc.alias.items()) or \
+                     any(sym in line for line in sc.src.split("\n")[:40]
+                         if line.startswith(("import ", "from ")))
+        if not has_import:
+            manual.append((f, f"{sc.path} does not import {sym} from {mod}; add the "
+                              f"import and re-run --fix"))
+            continue
+        line = sc.functions[target]["line"]
+        indent = " " * (len(sc.src.split("\n")[line - 1])
+                        - len(sc.src.split("\n")[line - 1].lstrip()))
+        edits.append((sc.path, line, indent + spec["decorator"],
+                      f"{target}() gets {spec['decorator']}, so its result is "
+                      "checkpointed and the retry reads it back"))
+    return edits, manual
+
+
+def apply_fixes(edits):
+    by_file = {}
+    for path, line, text, _ in edits:
+        by_file.setdefault(path, []).append((line, text))
+    for path, items in by_file.items():
+        lines = open(path, encoding="utf-8").read().split("\n")
+        for line, text in sorted(items, reverse=True):
+            lines.insert(line - 1, text)
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
+    return len(edits)
+
+
+def render_fixes(edits, manual, root):
+    if edits:
+        print("  edits this can make:\n")
+        for path, line, text, why in edits:
+            print(f"  {os.path.relpath(path, root)}:{line}")
+            print(f"    + {text.strip()}")
+            print(f"      {why}\n")
+    if manual:
+        print("  edits this refuses to make:\n")
+        for f, why in manual:
+            print(f"  {os.path.relpath(f['file'], root)}:{f['line']}  {f['what']}")
+            print(f"      {why}\n")
+    if edits:
+        print("  --fix --write applies the first list and leaves the second alone.")
+
+
 def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
     if frameworks:
         print(f"  frameworks seen: {', '.join(frameworks)}")
@@ -528,6 +624,20 @@ def research(pages):
     return summarize_and_outline(pages)
 '''
 
+TEMPORAL_MANUAL = '''
+from temporalio import workflow
+from openai import OpenAI
+
+def outline(summaries):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+
+@workflow.defn
+class Research:
+    @workflow.run
+    async def run(self, pages):
+        return outline(pages)
+'''
+
 TS_CASE = '''
 import { Inngest } from "inngest"
 import { summarize, outline } from "./agent"
@@ -593,7 +703,7 @@ def self_test():
         for label, src, want, kinds in cases:
             p = os.path.join(d, "case.py")
             open(p, "w").write(textwrap.dedent(src))
-            findings, fw = check_python([p], [])
+            findings, fw, _ = check_python([p], [])
             got = 1 if [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")] else 0
             seen = sorted({f["kind"] for f in findings})
             good = got == want and all(k in seen for k in kinds)
@@ -602,7 +712,7 @@ def self_test():
         # the multiplier, which is the difference between a rounding error and a bill
         p = os.path.join(d, "fanout.py")
         open(p, "w").write(textwrap.dedent(FANOUT))
-        findings, _ = check_python([p], [])
+        findings, _, _ = check_python([p], [])
         per = [f.get("per") for f in findings if f["kind"] == "UNPROTECTED"]
         good = per == ["pages"]
         ok &= good
@@ -613,6 +723,32 @@ def self_test():
         ok &= good
         print(f"  {'ok  ' if good else 'FAIL'}  the bill multiplies by --fanout: "
               f"{priced[-1].strip() if priced else 'no bill'}")
+
+        # --fix, both directions: it edits what it can prove and refuses the rest
+        p = os.path.join(d, "fixme.py")
+        open(p, "w").write(textwrap.dedent(UNPROTECTED))
+        findings, fw, scans = check_python([p], [])
+        edits, manual = plan_fixes(findings, scans, fw)
+        good = len(edits) == 1 and "@DBOS.step()" in edits[0][2] and not manual
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  --fix plans the decorator DBOS needs: "
+              f"{[e[2].strip() for e in edits]}")
+        apply_fixes(edits)
+        findings2, _, _ = check_python([p], [])
+        good = not [f for f in findings2 if f["kind"] in ("UNPROTECTED", "SHARED")]
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  the file it wrote comes back clean")
+
+        p = os.path.join(d, "refuse.py")
+        open(p, "w").write(textwrap.dedent(TEMPORAL_MANUAL))
+        before = open(p).read()
+        findings, fw, scans = check_python([p], [])
+        edits, manual = plan_fixes(findings, scans, fw)
+        apply_fixes(edits)
+        good = not edits and len(manual) == 1 and open(p).read() == before
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  --fix refuses Temporal and touches nothing: "
+              f"{[m[1][:38] for m in manual]}")
 
         p = os.path.join(d, "case.ts")
         open(p, "w").write(textwrap.dedent(TS_CASE))
@@ -635,6 +771,11 @@ def main():
                          "of a count. gpt-4o-mini at a few hundred tokens is about 0.0004")
     ap.add_argument("--fanout", type=int, default=10, metavar="N",
                     help="items to assume in a loop the source cannot size (default 10)")
+    ap.add_argument("--fix", action="store_true",
+                    help="show the edit that would protect each call, and say which ones "
+                         "this refuses to make and why")
+    ap.add_argument("--write", action="store_true",
+                    help="with --fix, apply the safe edits in place")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
@@ -645,13 +786,21 @@ def main():
     if not py and not ts:
         print(f"  nothing to read under {a.target}")
         return 0
-    findings, frameworks = check_python(py, a.expensive)
+    findings, frameworks, scans = check_python(py, a.expensive)
     findings += check_typescript(ts)
     if a.json:
         print(json.dumps({"frameworks": frameworks, "findings": findings}, indent=1))
         return 1 if [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")] else 0
     root = a.target if os.path.isdir(a.target) else os.path.dirname(a.target) or "."
-    return render(findings, frameworks, len(ts), root, a.cost, a.fanout)
+    rc = render(findings, frameworks, len(ts), root, a.cost, a.fanout)
+    if a.fix:
+        print()
+        edits, manual = plan_fixes(findings, scans, frameworks)
+        render_fixes(edits, manual, root)
+        if a.write and edits:
+            n = apply_fixes(edits)
+            print(f"\n  wrote {n} edit(s). Re-run without --fix to see what is left.")
+    return rc
 
 
 if __name__ == "__main__":

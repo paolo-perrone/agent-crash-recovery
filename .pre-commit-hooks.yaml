@@ -1,0 +1,20 @@
+# Add to your own .pre-commit-config.yaml:
+#
+#   - repo: https://github.com/paolo-perrone/agent-crash-recovery
+#     rev: main
+#     hooks:
+#       - id: boundaries
+#         args: [--cost, "0.0004"]
+#
+# It fails the commit when an expensive call sits outside a durability boundary,
+# which is the moment it is cheapest to fix.
+- id: boundaries
+  name: expensive calls outside a durability boundary
+  description: >
+    Reads your agent and names every model call your orchestrator reaches with no
+    boundary between, and every boundary holding more than one.
+  entry: boundaries
+  language: python
+  types: [python]
+  pass_filenames: false
+  args: ["."]

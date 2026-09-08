@@ -1,0 +1,30 @@
+# boundaries.py ships as a command so nobody has to clone a repo to run a tool
+# whose entire pitch is that it needs no setup (2026-09-07).
+#
+#   pipx install git+https://github.com/paolo-perrone/agent-crash-recovery
+#   uvx --from git+https://github.com/paolo-perrone/agent-crash-recovery boundaries .
+#
+# The package is one stdlib-only module on purpose: no dependencies means no
+# resolver, no lockfile and nothing to break when your own pins move.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-boundaries"
+version = "0.2.0"
+description = "Name every expensive call in your agent that a crash makes you pay for twice"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+keywords = ["durable execution", "agents", "langgraph", "temporal", "dbos", "inngest"]
+
+[project.urls]
+Homepage = "https://github.com/paolo-perrone/agent-crash-recovery"
+
+[project.scripts]
+boundaries = "boundaries:main"
+
+[tool.setuptools]
+py-modules = ["boundaries"]
