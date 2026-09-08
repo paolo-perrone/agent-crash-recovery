@@ -512,49 +512,132 @@ def check_python(paths, extra):
     return findings, sorted({fw for s in scans for fw in s.frameworks}), scans
 
 
-# --- TypeScript, by pattern and honest about it ------------------------------
-TS_FN = re.compile(r"createFunction\s*\(", re.S)
-TS_STEP = re.compile(r"step\.run\s*\(\s*[`\"'][^`\"']*[`\"']\s*,\s*\(\)\s*=>\s*([A-Za-z_$][\w$]*)")
-TS_AWAIT = re.compile(r"(?<!step\.run\()\bawait\s+([A-Za-z_$][\w$]*)\s*\(")
+# --- TypeScript, scanned rather than pattern-matched ---------------------------
+# A regex over TS source cannot tell a call inside step.run() from one beside it,
+# because it cannot see nesting. This is a small scanner: it strips strings,
+# template literals, regex literals and comments, then matches brackets, which is
+# enough to answer the one question that matters here, is this await inside a
+# step.run() span or outside it. It is not a parser and it does not need to be.
+def _ts_strip(src):
+    """Blank out strings, template literals and comments, preserving offsets."""
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            q, j = c, i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2; continue
+                if src[j] == q:
+                    break
+                j += 1
+            for k in range(i, min(j + 1, n)):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j + 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _ts_span(src, open_at):
+    """End offset of the bracket opened at `open_at`, or len(src)."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    stack = [pairs[src[open_at]]]
+    i = open_at + 1
+    while i < len(src) and stack:
+        ch = src[i]
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif stack and ch == stack[-1]:
+            stack.pop()
+        i += 1
+    return i
+
+
+TS_STEP_CALL = re.compile(r"\b(?:step\.run|step\.sleep|step\.invoke|step\.waitForEvent|"
+                          r"ctx\.run)\s*\(")
+TS_FN = re.compile(r"\bcreateFunction\s*\(")
+TS_AWAIT_CALL = re.compile(r"\bawait\s+([A-Za-z_$][\w$.]*)\s*\(")
+TS_SAFE = {"Promise", "fetch", "step", "ctx", "sleep", "JSON"}
 
 
 def check_typescript(paths):
     findings = []
     for p in paths:
-        src = open(p, encoding="utf-8").read()
+        raw = open(p, encoding="utf-8").read()
+        src = _ts_strip(raw)
         if not TS_FN.search(src):
             continue
-        wrapped = set(TS_STEP.findall(src))
-        for m in TS_AWAIT.finditer(src):
+        # every span that is already durable
+        protected = []
+        for m in TS_STEP_CALL.finditer(src):
+            protected.append((m.end() - 1, _ts_span(src, m.end() - 1)))
+        # every durable-function body
+        bodies = [(m.end() - 1, _ts_span(src, m.end() - 1)) for m in TS_FN.finditer(src)]
+        for m in TS_AWAIT_CALL.finditer(src):
             name = m.group(1)
-            if name in ("Promise", "fetch") or name in wrapped:
+            if name.split(".")[0] in TS_SAFE:
                 continue
-            # inside a step.run callback on the same line? then it is wrapped
-            line_start = src.rfind("\n", 0, m.start()) + 1
-            if "step.run" in src[line_start:m.start()]:
+            at = m.start()
+            if not any(a < at < b for a, b in bodies):
+                continue
+            if any(a < at < b for a, b in protected):
                 continue
             findings.append({
                 "kind": "UNPROTECTED", "file": p,
-                "line": src[:m.start()].count("\n") + 1,
+                "line": src[:at].count("\n") + 1,
                 "what": f"await {name}() outside step.run()",
                 "why": "the function body re-runs once per step, so anything outside a "
                        "step executes on every invocation"})
     return findings
 
 
-def collect(target):
+TEST_MARKERS = ("test_", "_test.py", "conftest.py")
+TEST_DIRS = {"tests", "test", "testing", "chaos-tests", "e2e", "integration_tests"}
+
+
+def _is_test(path):
+    """Calling a task directly in a test is how you test the task.
+
+    Five of the six findings left after the 2026-09-07 sweep were in test files, and
+    a linter that flags tests by default is a linter people uninstall."""
+    base = os.path.basename(path)
+    parts = set(os.path.normpath(path).split(os.sep))
+    return base.startswith(TEST_MARKERS[0]) or base.endswith(TEST_MARKERS[1]) \
+        or base == TEST_MARKERS[2] or bool(parts & TEST_DIRS)
+
+
+def collect(target, include_tests=False):
     py, ts = [], []
     if os.path.isfile(target):
         (py if target.endswith(".py") else ts).append(target)
         return py, ts
+    keep = (lambda p: True) if include_tests else (lambda p: not _is_test(p))
     for root, dirs, files in os.walk(target):
         dirs[:] = [d for d in dirs if d not in
                    {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}]
         for f in files:
             p = os.path.join(root, f)
-            if f.endswith(".py") and f != os.path.basename(__file__):
+            if f.endswith(".py") and f != os.path.basename(__file__) and keep(p):
                 py.append(p)
-            elif f.endswith((".ts", ".tsx")):
+            elif f.endswith((".ts", ".tsx")) and keep(p):
                 ts.append(p)
     return sorted(py), sorted(ts)
 
@@ -692,8 +775,8 @@ def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
     if frameworks:
         print(f"  frameworks seen: {', '.join(frameworks)}")
     if ts_count:
-        print(f"  {ts_count} TypeScript file(s) read by pattern, not by parser: "
-              "treat those lines as a prompt to look, not a verdict")
+        print(f"  {ts_count} TypeScript file(s) read by a bracket scanner rather than "
+              "a parser")
     print()
     if not findings:
         print("  every expensive call this could see sits behind its own boundary.")
@@ -776,6 +859,20 @@ class Research:
     @workflow.run
     async def run(self, pages):
         return outline(pages)
+'''
+
+TS_TRAPS = '''
+import { Inngest } from "inngest"
+import { search, summarize, outline, publish } from "./agent"
+export const inngest = new Inngest({ id: "x" })
+export const research = inngest.createFunction({ id: "r" }, { event: "e" },
+  async ({ event, step }) => {
+    const pages = await step.run("search: await outline( in a string", () => search(event.data.q))
+    const s = await Promise.all(pages.map((p) => step.run(`sum-${p.id}`, () => summarize(p))))
+    /* a comment containing await publish() must not count */
+    const o = await outline(s)
+    return step.run("publish", () => publish(s, o))
+  })
 '''
 
 TS_CASE = '''
@@ -890,6 +987,15 @@ def self_test():
         print(f"  {'ok  ' if good else 'FAIL'}  --fix refuses Temporal and touches nothing: "
               f"{[m[1][:38] for m in manual]}")
 
+        # the scanner earns its keep on the cases a regex cannot see
+        p = os.path.join(d, "traps.ts")
+        open(p, "w").write(textwrap.dedent(TS_TRAPS))
+        f = check_typescript([p])
+        good = len(f) == 1 and "outline" in f[0]["what"]
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  TS: a step.run label and a comment that both "
+              f"contain `await x()` are ignored: {[x['what'] for x in f]}")
+
         p = os.path.join(d, "case.ts")
         open(p, "w").write(textwrap.dedent(TS_CASE))
         f = check_typescript([p])
@@ -911,6 +1017,9 @@ def main():
                          "of a count. gpt-4o-mini at a few hundred tokens is about 0.0004")
     ap.add_argument("--fanout", type=int, default=10, metavar="N",
                     help="items to assume in a loop the source cannot size (default 10)")
+    ap.add_argument("--include-tests", action="store_true",
+                    help="also read test files, where calling a task directly is normal "
+                         "and expected. Skipped by default.")
     ap.add_argument("--fix", action="store_true",
                     help="show the edit that would protect each call, and say which ones "
                          "this refuses to make and why")
@@ -922,7 +1031,7 @@ def main():
     if a.self_test:
         return self_test()
 
-    py, ts = collect(a.target)
+    py, ts = collect(a.target, a.include_tests)
     if not py and not ts:
         print(f"  nothing to read under {a.target}")
         return 0

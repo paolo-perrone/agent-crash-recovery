@@ -36,6 +36,19 @@ jobs:
         run: |
           pip install --quiet .
           boundaries --self-test
+      - name: boundaries.py finds nothing in its own non-test tree beyond the known defect
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "boundaries.py", ".", "--json"],
+                             capture_output=True, text=True)
+          import json
+          d = json.loads(r.stdout)
+          act = [f for f in d["findings"] if f["kind"] in ("UNPROTECTED", "SHARED")]
+          assert len(act) == 1, f"expected exactly the inngest defect, got {act}"
+          assert "inngest_impl" in act[0]["file"], act[0]
+          print("one finding, and it is the deliberate one")
+          PY
       - name: every documented file exists
         run: |
           python - <<'PY'

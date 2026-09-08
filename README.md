@@ -122,6 +122,13 @@ assumptions are yours and both are printed:
   A thousand crashes: $4.40.
 ```
 
+**Measured false-positive rate.** Swept over langgraph, temporalio/samples-python, prefect,
+dbos-transact-py and hatchet on 2026-09-07: 2,815 non-test Python files, one finding, and
+that one is real (an `@activity.defn` doing an S3 read and an S3 write, so a crash repays
+both). The first run of that sweep produced 1,048 findings and every fix since came from
+reading what it flagged in code that was correct. Test files are skipped by default, because
+calling a task directly in a test is how you test the task; `--include-tests` reads them.
+
 It is strictly weaker than the probe: it cannot see runtime behaviour and it cannot price
 anything. It is also the one you will actually run before you ship. What it cannot see is
 listed in the header of the file, and a call it could not resolve is reported as
