@@ -236,7 +236,18 @@ real resume. What the crash costs in money still needs your own API key.
   only 'summarize' was repaid, which is the floor.
 ```
 
-Four defects turned up in the first fifteen minutes of running these, and every one of them
+**Temporal**, one Activity per page, worker and starter in one process group:
+
+```
+  step            once  killed  restart  repaid
+  outline            1       0        1      +0
+  publish            1       0        1      +0
+  search             1       1        0      +0
+  summarize         11       5        6      +0
+  nothing was repaid at all (the kill landed between steps)
+```
+
+Six defects turned up in the first hour of running these, and every one of them
 meant a path in this repo had never executed:
 
 1. **LangGraph re-ran the whole graph on resume.** `invoke()` was called with
@@ -251,17 +262,22 @@ meant a path in this repo had never executed:
 4. **DBOS keeps its state in a separate database**, `durable_dbos_sys`, not in a `dbos`
    schema inside your application database. The reset was dropping the schema, which cleared
    nothing.
-5. **The Temporal healthcheck could never pass.** The server binds the container's IP and
+5. **Temporal's restart re-submitted the workflow instead of resuming it.** A killed
+   worker leaves the execution Running. Calling `execute_workflow` again with the same id
+   raises `WorkflowAlreadyStartedError`, the client dies, and the worker that would have
+   resumed it never gets the chance. The client now describes the workflow first and
+   attaches to the handle when one is Running. Same shape as defect 1, in a different SDK.
+6. **The Temporal healthcheck could never pass.** The server binds the container's IP and
    the CLI defaults to `127.0.0.1:7233`, so `docker compose ps` reported the container
    unhealthy while it was serving fine, and `run-demo.sh temporal` would have spun for two
    minutes and declared a working server dead.
 
-**Temporal is not measured yet.** It runs end to end now, and `temporal_impl/run_once.sh`
-puts the worker and the starter in one process group so the probe's kill reaches the process
-doing the work. The three-run protocol still returns a restart of zero executions that has
-no explanation yet, so there is no Temporal number here rather than a number nobody checked.
+`temporal_impl/run_once.sh` puts the worker and the starter in one process group, because
+Temporal executes activities in the WORKER and the probe kills only what it spawned. It also
+writes the worker's output to a file: a worker that dies silently takes the measurement with
+it and leaves nothing to read, which cost a debugging round.
 
-**Inngest is not measured either**, for the reason in "Measuring Inngest" above.
+**Inngest is still not measured**, for the reason in "Measuring Inngest" above. Three of four.
 
 ### What is not measured here
 

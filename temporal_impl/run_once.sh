@@ -8,7 +8,10 @@
 # first real run on 2026-09-08 logged an empty baseline for exactly this reason.
 set -uo pipefail
 PY="${PYTHON:-python}"
-$PY -m temporal_impl.worker >/dev/null 2>&1 &
+# The worker's stderr goes to a file, never to /dev/null. A worker that dies on
+# import takes the whole measurement with it and leaves no trace, which cost a
+# debugging round on 2026-09-08.
+$PY -m temporal_impl.worker > "${WORKER_LOG:-/tmp/temporal-worker.log}" 2>&1 &
 WORKER=$!
 trap 'kill -9 $WORKER 2>/dev/null' EXIT
 for _ in $(seq 1 40); do

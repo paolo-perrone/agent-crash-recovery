@@ -6,12 +6,31 @@ resuming the killed one, re-executed all thirteen calls, and reported Temporal a
 repaying the entire run. Resetting between the baseline and the killed run is the
 reset command's job, not the id's: see run-demo.sh."""
 import argparse, asyncio, os
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError, RPCStatusCode
 from temporal_impl.worker import Research
 
 
 async def run(query: str, wf_id: str):
+    """Start the workflow, or ATTACH to the one already on the server.
+
+    A killed worker leaves the workflow Running. Re-submitting the same id then
+    raises WorkflowAlreadyStartedError, the client dies, and the worker that would
+    have resumed it never gets the chance. The resume is not a new submission: a
+    worker comes back, Temporal replays the history, and the client waits on the
+    handle for the result. Found on the first real run, 2026-09-08, where the
+    restart logged zero executions and the failure looked like a durability
+    finding."""
     client = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"))
+    handle = client.get_workflow_handle(wf_id)
+    try:
+        desc = await handle.describe()
+    except RPCError as e:
+        if e.status != RPCStatusCode.NOT_FOUND:
+            raise
+        desc = None
+    if desc is not None and desc.status == WorkflowExecutionStatus.RUNNING:
+        return await handle.result()
     return await client.execute_workflow(
         Research.run, query, id=wf_id, task_queue="research")
 
