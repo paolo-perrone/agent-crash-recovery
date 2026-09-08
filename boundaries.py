@@ -697,28 +697,8 @@ def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
     print()
     if not findings:
         print("  every expensive call this could see sits behind its own boundary.")
-        print("  That is evidence, not a guarantee: read MEASURED FALSE-POSITIVE RATE
-Swept over five real framework repositories on 2026-09-07, 4,129 Python files:
-langchain-ai/langgraph, temporalio/samples-python, PrefectHQ/prefect,
-dbos-inc/dbos-transact-py and hatchet-dev/hatchet. It reports six findings, and
-the sweep is how eight bugs in this file were found, every one of which made
-correct code look broken:
-
-  a call graph keyed by bare function name across a whole tree (889 findings on
-    one repo, all wrong), now keyed per file
-  `invoke`, `ainvoke` and `predict` in the expensive list, which is LangChain's
-    universal verb (38 findings), now gone
-  bare vendor roots, so AsyncOpenAI() counted as a charge (4 findings), now gone
-  boundaries keyed file-locally, missing every task imported from another module
-  decorator markers matched as substrings, so @flow_run_app.command() was a flow
-  a nested orchestrator not treated as durable, so flow-calls-flow was flagged
-  clients that carry the boundary themselves, like temporalio.contrib
-  a function passed to execute_activity counted as a direct call
-
-Run it against your own corpus before you trust it on your code. That is the only
-way any of the above was discovered, and fixtures found none of them.
-
-WHAT IT CANNOT SEE in the header.")
+        print("  That is evidence, not a guarantee: read WHAT IT CANNOT SEE "
+              "in the header.")
         return 0
     order = {"UNPROTECTED": 0, "SHARED": 1, "UNREADABLE": 2, "SKIPPED": 3}
     for f in sorted(findings, key=lambda f: (order.get(f["kind"], 9), f["file"], f["line"])):

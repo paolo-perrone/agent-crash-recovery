@@ -18,6 +18,8 @@ jobs:
         run: python test_probe.py
       - name: end-to-end self-test (durable / non-durable / coarse stand-ins)
         run: python probe.py --self-test
+      - name: boundaries.py is syntactically valid
+        run: python -c "import ast; ast.parse(open('boundaries.py').read())"
       - name: boundaries.py self-test
         run: python boundaries.py --self-test
       - name: boundaries.py still catches this repo's own deliberate defect
