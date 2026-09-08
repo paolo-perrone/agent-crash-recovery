@@ -292,10 +292,19 @@ worked:
 
 `inngest_impl/measure.sh` measures it the way Inngest actually recovers: the dev server owns
 the run, your app is a callback target, and recovery happens when the APP comes back with no
-second event. It has produced a full 14-execution baseline by hand but not yet a complete
-three-phase table, because the three-process dance (dev server, served app, event client)
-keeps losing one of the three between phases. That is an environment problem rather than a
-finding, and there is no Inngest number here until it runs clean.
+second event. It has produced a full 14-execution baseline by hand and not yet a trustworthy three-phase
+table. Five orchestration bugs were found and fixed on the way, all commented in the script,
+and one is unsolved: the three phases share one dev server and one queue, so a retry
+scheduled in one phase can execute during the next. A 2-second kill produced an empty
+baseline and 22 summarize in the restart, which is the baseline's own work arriving late.
+
+Fixing it means a fresh dev server and a drained queue per phase, or reading the run's step
+history from the dev server's API rather than counting executions in a ledger. Until then
+there is no Inngest number, and an untrustworthy one is worse than none.
+
+One thing the attempt did establish: **Inngest fans the summaries out with `Promise.all`,
+so a run that takes about 15 seconds in the sequential Python implementations takes about 5
+here.** Any kill window tuned on the others is too late for this one.
 
 Three of the four implementations are measured.
 

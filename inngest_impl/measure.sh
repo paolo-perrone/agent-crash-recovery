@@ -12,6 +12,31 @@
 #
 # Same arithmetic as probe.py: repaid = (killed + restart) - baseline.
 #
+# NOT YET PRODUCING A TRUSTWORTHY TABLE, 2026-09-08. Five failure modes were found
+# and fixed here, and the sixth is unsolved:
+#
+#   1. A PID captured through $(...) is the subshell's, so the kill missed and every
+#      phase wrote to the baseline ledger.
+#   2. `lsof -ti :3000` matches CLIENTS as well as listeners, so clearing the port
+#      killed the dev server, which polls the app there. Use -sTCP:LISTEN.
+#   3. With --no-discovery the dev server syncs on its own schedule, so an app
+#      restarted between phases is never registered and the event goes nowhere.
+#      A PUT to the app's endpoint registers it immediately.
+#   4. tsx spawns node as a CHILD. kill -9 on the tsx pid leaves the server running,
+#      and it finishes the run into the ledger it started with.
+#   5. Inngest fans the summaries out with Promise.all, so a run that takes 15s in
+#      the sequential Python implementations takes about 5s here. KILL_AFTER has to
+#      be a few seconds, not eight.
+#   6. UNSOLVED: the three phases share one dev server and one queue, and a retry
+#      scheduled during one phase can execute during the next. A 2-second kill
+#      produced an empty baseline and 22 summarize in the restart, which is the
+#      baseline's own work arriving late.
+#
+# Fixing 6 means a fresh dev server and a drained queue per phase, or reading the
+# run's step history from the dev server's API rather than counting executions in a
+# ledger. Until then there is no Inngest number, and an untrustworthy one is worse
+# than none.
+#
 # The app is started INLINE, never through command substitution. Capturing the PID
 # with $(...) returns the subshell's pid, the kill misses, and the app keeps writing
 # to whichever ledger it started with. That produced a baseline of 22 summarize and
@@ -33,10 +58,23 @@ free_port() {
   lsof -ti tcp:3000 -sTCP:LISTEN 2>/dev/null | while read -r pid; do kill -9 "$pid" 2>/dev/null; done
   sleep 0.5
 }
-wait_up() {  # $1 = pid of the app WE started
+wait_up() {  # $1 = pid of the app WE started, $2 = its log
   for _ in $(seq 1 40); do
     kill -0 "$1" 2>/dev/null || { echo "the app exited during startup:"; tail -5 "$2"; return 1; }
-    curl -sf -o /dev/null http://localhost:3000/api/inngest && return 0
+    if curl -sf -o /dev/null http://localhost:3000/api/inngest; then
+      # PUT registers the app with the dev server immediately. With --no-discovery
+      # the server otherwise syncs on its own schedule, and an app restarted between
+      # phases misses that window, so the event publishes and nothing ever invokes
+      # the function (2026-09-08).
+      curl -sf -o /dev/null -X PUT http://localhost:3000/api/inngest || true
+      for _ in $(seq 1 20); do
+        curl -s http://localhost:8288/v0/gql -X POST -H 'content-type: application/json' \
+          -d '{"query":"{ functions { name } }"}' 2>/dev/null | grep -q research-agent && return 0
+        sleep 0.5
+      done
+      echo "the app is serving but the dev server never registered its function"
+      return 1
+    fi
     sleep 0.5
   done
   return 1
@@ -50,6 +88,20 @@ wait_down() {
 }
 
 for f in baseline killed restart; do : > "$LEDGERS/$f.jsonl"; done
+
+kill_app() {
+  # tsx spawns node as a CHILD. kill -9 on the tsx pid leaves the real server alive,
+  # and it happily finishes the run into whichever ledger it started with: the killed
+  # phase logged all 14 executions and the restart logged none (2026-09-08). Kill the
+  # children first, then the wrapper.
+  pkill -9 -P "$1" 2>/dev/null
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  for _ in $(seq 1 20); do
+    curl -sf -o /dev/null http://localhost:3000/api/inngest || return 0
+    sleep 0.5
+  done
+}
 
 # The script owns the dev server too. Leaving it to another shell means the whole
 # measurement depends on a process nothing here can see, and a dev server that dies
@@ -78,7 +130,7 @@ PROBE_LEDGER="$LEDGERS/baseline.jsonl" PROBE_OFFLINE=1 INNGEST_DEV=1 \
 APP=$!
 wait_up "$APP" "$LEDGERS/app-baseline.log" || exit 1
 PROBE_OFFLINE=1 INNGEST_DEV=1 $TSX inngest_impl/fire.ts "kv cache eviction" >/dev/null 2>&1
-kill -9 "$APP" 2>/dev/null; wait "$APP" 2>/dev/null; wait_down
+kill_app "$APP"
 
 echo "== killed"
 free_port
@@ -89,8 +141,8 @@ wait_up "$APP" "$LEDGERS/app-killed.log" || exit 1
 PROBE_OFFLINE=1 INNGEST_DEV=1 $TSX inngest_impl/fire.ts "kv cache eviction" >/dev/null 2>&1 &
 FIRE=$!
 sleep "$KILL_AFTER"
-kill -9 "$APP" 2>/dev/null; kill -9 "$FIRE" 2>/dev/null
-wait "$APP" 2>/dev/null; wait "$FIRE" 2>/dev/null; wait_down
+kill_app "$APP"
+pkill -9 -P "$FIRE" 2>/dev/null; kill -9 "$FIRE" 2>/dev/null; wait "$FIRE" 2>/dev/null
 
 echo "== restart (no new event; the dev server retries the same run)"
 free_port
@@ -99,7 +151,7 @@ PROBE_LEDGER="$LEDGERS/restart.jsonl" PROBE_OFFLINE=1 INNGEST_DEV=1 \
 APP=$!
 wait_up "$APP" "$LEDGERS/app-restart.log" || exit 1
 sleep "$RESTART_WAIT"
-kill -9 "$APP" 2>/dev/null; wait "$APP" 2>/dev/null
+kill_app "$APP"
 
 echo "== table"
 python3 - "$LEDGERS" <<'PY'
