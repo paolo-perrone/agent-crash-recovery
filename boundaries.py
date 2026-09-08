@@ -566,7 +566,7 @@ def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
         print(f"  {f['kind']:<12} {rel}:{f['line']}")
         print(f"               {f['what']}")
         if f.get("per"):
-            print(f"               repaid once per item in {f['per']}, not once")
+            print(f"               repaid once per item in {f['per']}")
         print(f"               {f['why']}")
         print()
     bad = [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")]
