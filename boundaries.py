@@ -27,6 +27,27 @@ DBOS step, a Temporal Activity, an Inngest step.run(). Two failures matter.
 Expensive means it costs money or wall time: a model call, an HTTP request, a
 paid API client. The list is in EXPENSIVE below and --expensive adds to it.
 
+MEASURED FALSE-POSITIVE RATE
+Swept over five real framework repositories on 2026-09-07, 4,129 Python files:
+langchain-ai/langgraph, temporalio/samples-python, PrefectHQ/prefect,
+dbos-inc/dbos-transact-py and hatchet-dev/hatchet. It reports six findings, and
+the sweep is how eight bugs in this file were found, every one of which made
+correct code look broken:
+
+  a call graph keyed by bare function name across a whole tree (889 findings on
+    one repo, all wrong), now keyed per file
+  `invoke`, `ainvoke` and `predict` in the expensive list, which is LangChain's
+    universal verb (38 findings), now gone
+  bare vendor roots, so AsyncOpenAI() counted as a charge (4 findings), now gone
+  boundaries keyed file-locally, missing every task imported from another module
+  decorator markers matched as substrings, so @flow_run_app.command() was a flow
+  a nested orchestrator not treated as durable, so flow-calls-flow was flagged
+  clients that carry the boundary themselves, like temporalio.contrib
+  a function passed to execute_activity counted as a direct call
+
+Run it against your own corpus before you trust it on your code. That is the only
+way any of the above was discovered, and fixtures found none of them.
+
 WHAT IT CANNOT SEE
 Dynamic dispatch, calls through a variable the analysis cannot resolve, anything
 imported from a package it was not pointed at, and every framework not in
@@ -39,15 +60,33 @@ import argparse, ast, json, os, re, sys, tempfile, textwrap
 # --- what counts as expensive ------------------------------------------------
 # Attribute chains and bare names. Matched against the dotted source of the call,
 # so "openai" catches OpenAI().chat.completions.create through its receiver too.
+# NO BARE VERBS. `invoke`, `ainvoke` and `predict` were in this list until a sweep
+# over five real framework repos on 2026-09-07: they are LangChain's universal call
+# verb, so they matched 38 call sites in temporalio/samples-python alone, every one
+# of them correct code. A term earns its place here by naming a vendor or an API
+# path, never by naming an action.
+# NO BARE VENDOR ROOTS EITHER. `AsyncOpenAI(max_retries=0)` costs nothing, and
+# counting it made every activity that builds a client look like two charges in
+# one boundary. Four of temporalio/samples-python's SHARED findings were that,
+# and all four were correct code. A vendor name earns a hit only with an API path
+# behind it.
 EXPENSIVE = [
-    "openai", "anthropic", "cohere", "mistralai", "groq", "together",
     "chat.completions.create", "messages.create", "embeddings.create",
     "responses.create", "images.generate", "audio.transcriptions.create",
+    "models.generate_content", "chat.send_message",
     "requests.get", "requests.post", "requests.put", "requests.delete",
     "httpx.get", "httpx.post", "httpx.request", "aiohttp",
     "boto3", "s3.upload", "s3.download", "bigquery", "stripe",
-    "invoke", "ainvoke", "predict", "generate_content",
 ]
+
+# Calls that CROSS a boundary rather than make one. A function handed to any of
+# these executes inside the framework's own durable step, so passing it is not
+# calling it, and the call graph must not draw the edge. `run() calls _run()`
+# in temporalio's langsmith sample was exactly this: _run's only job is to invoke
+# execute_activity.
+BOUNDARY_INVOKERS = ["execute_activity", "execute_local_activity",
+                     "execute_child_workflow", "start_activity", "step.run",
+                     "ctx.run", "start_child_workflow"]
 
 # --- how each framework marks a boundary -------------------------------------
 # Each entry: the import that identifies it, decorator fragments that mark a
@@ -79,6 +118,14 @@ FRAMEWORKS = {
                    "register": [], "ctx_run": ["ctx.run"], "name": "ctx.run()"},
 }
 
+# Clients that ARE the boundary. A plugin can route every call it receives through
+# an activity or a step, so a model call on one of these is already durable even
+# though the source shows a bare SDK call. Found on 2026-09-07: the Temporal Google
+# GenAI samples were flagged 20 times for exactly this, and every one was correct
+# code. The module prefix is the signal; the object it hands you carries the
+# boundary.
+WRAPPED_CLIENTS = ["temporalio.contrib"]
+
 # Frameworks whose durability lives in configuration rather than in your code, so
 # reading the source proves nothing. Named so a clean report cannot be mistaken for
 # coverage the checker does not have.
@@ -108,6 +155,11 @@ def _is_expensive(dotted, extra):
     return any(term.lower() in dotted for term in EXPENSIVE + list(extra))
 
 
+def _seg_match(dotted, marker):
+    """True when `marker` is the whole dotted name or its final segment(s)."""
+    return dotted == marker or dotted.endswith("." + marker)
+
+
 def _decorators(fn):
     return [_dotted(d) for d in fn.decorator_list]
 
@@ -124,7 +176,10 @@ class FileScan:
         self.orchestrators = {}    # name -> why
         self.alias = {}            # local name -> original def name
         self.imported = {}         # local name -> module it came from
+        self.wrapped_ctors = set()  # constructors whose instances carry a boundary
+        self.wrapped_vars = set()   # variables holding one
         self._imports()
+        self._wrapped_vars()
         self._functions()
         self._boundaries()
 
@@ -151,6 +206,28 @@ class FileScan:
                 for a in n.names:
                     if a.asname:
                         self.alias[a.asname] = a.name.split(".")[-1]
+            if isinstance(n, ast.ImportFrom) and n.module and \
+                    any(n.module.startswith(w) for w in WRAPPED_CLIENTS):
+                for a in n.names:
+                    self.wrapped_ctors.add(a.asname or a.name)
+
+    def _wrapped_vars(self):
+        """`client = TemporalAsyncClient()` makes every call on `client` durable."""
+        if not self.wrapped_ctors:
+            return
+        # Two passes: an object handed out BY a wrapped client is wrapped too, and
+        # it is usually assigned after the client. google_genai/chat does exactly
+        # this with client.chats.create().
+        for _ in range(2):
+          for a in ast.walk(self.tree):
+            if not isinstance(a, ast.Assign) or not isinstance(a.value, ast.Call):
+                continue
+            known = {c.lower() for c in self.wrapped_ctors} | self.wrapped_vars
+            d = _dotted(a.value.func)
+            if d.split(".")[0] in known or d in known:
+                for t in a.targets:
+                    if isinstance(t, ast.Name):
+                        self.wrapped_vars.add(t.id.lower())
 
     def _functions(self):
         for fn in ast.walk(self.tree):
@@ -177,6 +254,16 @@ class FileScan:
                         if isinstance(inner, ast.Call):
                             loops.setdefault(inner.lineno, label)
 
+            crossed = set()
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and \
+                        any(_dotted(c.func).endswith(b) for b in BOUNDARY_INVOKERS):
+                    for arg in c.args:
+                        if isinstance(arg, ast.Name):
+                            crossed.add(arg.id)
+                        elif isinstance(arg, ast.Attribute):
+                            crossed.add(arg.attr)
+
             calls, spend = [], []
             for c in ast.walk(fn):
                 if not isinstance(c, ast.Call):
@@ -184,14 +271,23 @@ class FileScan:
                 d = _dotted(c.func)
                 if not d:
                     continue
-                if _is_expensive(d, self.extra):
+                # A call under a namespace imported from a wrapped module carries the
+                # boundary too: `from temporalio.contrib import openai_agents` makes
+                # every openai_agents.* call durable, and the dotted string still says
+                # "openai".
+                root = d.split(".")[0]
+                if _is_expensive(d, self.extra) and root not in self.wrapped_vars \
+                        and root not in {c.lower() for c in self.wrapped_ctors}:
                     spend.append((d, c.lineno))
-                calls.append((d.split(".")[-1], c.lineno))
+                tail = d.split(".")[-1]
+                if tail not in crossed:
+                    calls.append((tail, c.lineno))
             # One expression, one charge. `OpenAI().chat.completions.create(...)` is
             # two Call nodes and one bill, so spends collapse by line.
             by_line = {}
             for d, line in spend:
                 by_line.setdefault(line, d)
+            self.crossed = getattr(self, "crossed", set()) | crossed
             self.functions[fn.name] = {"calls": calls,
                                        "spend": sorted((d, ln) for ln, d in by_line.items()),
                                        "node": fn, "line": fn.lineno, "loops": loops}
@@ -206,11 +302,15 @@ class FileScan:
 
         for name, info in self.functions.items():
             for dec in _decorators(info["node"]):
+                # Whole segment, never substring. `m in dec` made
+                # @flow_run_app.command() a Prefect flow, so a CLI command named
+                # retry() was reported as an orchestrator spending outside a
+                # boundary. Found on prefect's own cli/flow_run.py, 2026-09-07.
                 for m in b_marks:
-                    if dec.endswith(m) or m in dec:
+                    if _seg_match(dec, m):
                         self.boundaries.setdefault(name, f"@{dec}()")
                 for m in o_marks:
-                    if dec.endswith(m) or m in dec:
+                    if _seg_match(dec, m):
                         self.orchestrators.setdefault(name, f"@{dec}()")
         # An orchestrator marker wins over a boundary marker of the same word:
         # Prefect and Airflow both spell a boundary `@task`, and Prefect spells the
@@ -224,7 +324,7 @@ class FileScan:
             if not isinstance(cls, ast.ClassDef):
                 continue
             decs = [_dotted(x) for x in cls.decorator_list]
-            if any(m in d for d in decs for m in o_marks):
+            if any(_seg_match(d, m) for d in decs for m in o_marks):
                 for mem in cls.body:
                     if isinstance(mem, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         self.orchestrators[mem.name] = "@" + decs[0] + "()"
@@ -276,26 +376,57 @@ def _resolve(name, alias):
 
 
 def _spend_map(scans, extra):
-    """function name -> True if calling it eventually spends money.
+    """(function key) -> True if calling it eventually spends money.
 
-    Fixed point over the whole scanned tree, so an orchestrator calling a helper
-    that calls the SDK is still seen as spending. This is what makes the checker
-    work on a repo where the expensive calls live in one shared module."""
-    direct = {}
-    edges = {}
-    for s in scans:
-        for name, info in s.functions.items():
-            direct[name] = bool(info["spend"])
-            edges.setdefault(name, set()).update(
-                _resolve(c, s.alias) for c, _ in info["calls"])
-    spends = {n for n, v in direct.items() if v}
+    KEYED PER FILE, not by bare name. Keying globally by name was this checker's
+    worst bug: in a tree of any size some unrelated `workflow()` touches an SDK,
+    and every same-named function in every other file inherits it. On
+    dbos-transact-py that produced 889 findings, all 889 of them wrong. An edge
+    now exists only when the callee is defined in the same file, or imported from
+    a module this scan actually read.
+    """
+    by_module = {}
+    for sc in scans:
+        mod = os.path.splitext(sc.path)[0].replace(os.sep, ".")
+        by_module[mod] = sc
+    direct, edges = {}, {}
+
+    def key(sc, name):
+        return (sc.path, name)
+
+    def target(sc, local):
+        """Where a call in `sc` resolves: same file, or a scanned import."""
+        orig = _resolve(local, sc.alias)
+        if orig in sc.functions:
+            return key(sc, orig)
+        mod = sc.imported.get(local)
+        if mod:
+            tail = mod.replace(".", os.sep)
+            for m, other in by_module.items():
+                if m.endswith(mod) or other.path.endswith(tail + ".py") or \
+                        other.path.endswith(os.path.join(tail, "__init__.py")):
+                    if orig in other.functions:
+                        return key(other, orig)
+        return None
+
+    for sc in scans:
+        for name, info in sc.functions.items():
+            direct[key(sc, name)] = bool(info["spend"])
+            e = set()
+            for c, _ in info["calls"]:
+                t = target(sc, c)
+                if t:
+                    e.add(t)
+            edges[key(sc, name)] = e
+
+    spends = {k for k, v in direct.items() if v}
     changed = True
     while changed:
         changed = False
-        for name, callees in edges.items():
-            if name not in spends and (callees & spends):
-                spends.add(name); changed = True
-    return spends
+        for k, callees in edges.items():
+            if k not in spends and (callees & spends):
+                spends.add(k); changed = True
+    return spends, target
 
 
 def check_python(paths, extra):
@@ -306,11 +437,17 @@ def check_python(paths, extra):
         except SyntaxError as e:
             findings.append({"kind": "SKIPPED", "file": p, "line": e.lineno or 0,
                              "what": "could not parse", "why": str(e)})
-    spends = _spend_map(scans, extra)
-    # Boundaries stay LOCAL. `summarize_s = step(_summarize)` protects the name
-    # summarize_s and nothing else; resolving it through the alias chain marked
-    # _summarize protected too, and a workflow calling the bare function read as
-    # clean. Found by this checker's own negative control, twice.
+    spends, target = _spend_map(scans, extra)
+    # A boundary is (file, name), the same key shape as a spender. Keyed by bare
+    # name it marked the wrong function protected; keyed file-locally it missed
+    # every task imported from another module, which is how Prefect and Celery
+    # codebases are actually laid out. The 2026-09-07 sweep found both, one after
+    # the other, on prefect-gcp's own tests.
+    boundary_keys = {(sc.path, n) for sc in scans for n in sc.boundaries}
+    # A nested orchestrator is durable in its own right: a Prefect subflow and a
+    # DBOS child workflow both checkpoint. Calling one is not an unprotected call,
+    # and prefect's own tests are full of them.
+    boundary_keys |= {(sc.path, n) for sc in scans for n in sc.orchestrators}
     # Anything called from a scanned file, imported from a module the scan never
     # read, and not obviously stdlib. A clean report over a partial tree is not a
     # clean repo, and saying so is the difference between evidence and comfort.
@@ -338,8 +475,8 @@ def check_python(paths, extra):
             # SHARED: one boundary, several expensive calls
             if in_boundary:
                 spend_lines = {ln for _, ln in info["spend"]}
-                reached = {(_resolve(c, s.alias), ln) for c, ln in info["calls"]
-                           if _resolve(c, s.alias) in spends and ln not in spend_lines}
+                reached = {(c, ln) for c, ln in info["calls"]
+                           if target(s, c) in spends and ln not in spend_lines}
                 n = len(info["spend"]) + len(reached)
                 if n > 1:
                     findings.append({
@@ -352,10 +489,12 @@ def check_python(paths, extra):
             # UNPROTECTED: an orchestrator spending outside any boundary
             if name in s.orchestrators:
                 for raw, line in info["calls"]:
-                    if raw in s.boundaries:      # called through the wrapper: protected
+                    t = target(s, raw)
+                    if raw in s.boundaries or raw in s.orchestrators or \
+                            t in boundary_keys:
                         continue
                     callee = _resolve(raw, s.alias)
-                    if callee in spends:
+                    if t in spends:
                         per = info["loops"].get(line)
                         findings.append({
                             "kind": "UNPROTECTED", "file": s.path, "line": line,
@@ -558,7 +697,28 @@ def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
     print()
     if not findings:
         print("  every expensive call this could see sits behind its own boundary.")
-        print("  That is evidence, not a guarantee: read WHAT IT CANNOT SEE in the header.")
+        print("  That is evidence, not a guarantee: read MEASURED FALSE-POSITIVE RATE
+Swept over five real framework repositories on 2026-09-07, 4,129 Python files:
+langchain-ai/langgraph, temporalio/samples-python, PrefectHQ/prefect,
+dbos-inc/dbos-transact-py and hatchet-dev/hatchet. It reports six findings, and
+the sweep is how eight bugs in this file were found, every one of which made
+correct code look broken:
+
+  a call graph keyed by bare function name across a whole tree (889 findings on
+    one repo, all wrong), now keyed per file
+  `invoke`, `ainvoke` and `predict` in the expensive list, which is LangChain's
+    universal verb (38 findings), now gone
+  bare vendor roots, so AsyncOpenAI() counted as a charge (4 findings), now gone
+  boundaries keyed file-locally, missing every task imported from another module
+  decorator markers matched as substrings, so @flow_run_app.command() was a flow
+  a nested orchestrator not treated as durable, so flow-calls-flow was flagged
+  clients that carry the boundary themselves, like temporalio.contrib
+  a function passed to execute_activity counted as a direct call
+
+Run it against your own corpus before you trust it on your code. That is the only
+way any of the above was discovered, and fixtures found none of them.
+
+WHAT IT CANNOT SEE in the header.")
         return 0
     order = {"UNPROTECTED": 0, "SHARED": 1, "UNREADABLE": 2, "SKIPPED": 3}
     for f in sorted(findings, key=lambda f: (order.get(f["kind"], 9), f["file"], f["line"])):
