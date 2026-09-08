@@ -2,13 +2,23 @@
 import { appendFileSync } from "fs"
 import OpenAI from "openai"
 
-const LEDGER = process.env.PROBE_LEDGER ?? "/tmp/probe-ledger.jsonl"
+const LEDGER = process.env.PROBE_LEDGER ?? `/tmp/probe-ledger-${process.pid}.jsonl`
 const openai = new OpenAI()
 
-/** One line per ACTUAL execution. A memoized step never reaches this. */
-function probe<T>(name: string, fn: () => Promise<T> | T): Promise<T> | T {
-  appendFileSync(LEDGER, JSON.stringify({ step: name, t: Date.now() / 1000 }) + "\n")
-  return fn()
+/**
+ * `attempt` before the call, `completed` after it resolves. A memoized step reaches
+ * neither. Two lines, not one (2026-09-07): the Python twin changed for the same
+ * reason, that an attempt killed before the API call is not a charge.
+ */
+function write(step: string, phase: "attempt" | "completed") {
+  appendFileSync(LEDGER, JSON.stringify({ step, phase, t: Date.now() / 1000 }) + "\n")
+}
+
+async function probe<T>(name: string, fn: () => Promise<T> | T): Promise<T> {
+  write(name, "attempt")
+  const out = await fn()
+  write(name, "completed")
+  return out
 }
 
 export type Page = { id: string; url: string; text: string }

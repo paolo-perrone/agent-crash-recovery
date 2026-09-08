@@ -18,6 +18,45 @@ jobs:
         run: python test_probe.py
       - name: end-to-end self-test (durable / non-durable / coarse stand-ins)
         run: python probe.py --self-test
+      - name: boundaries.py self-test
+        run: python boundaries.py --self-test
+      - name: boundaries.py still catches this repo's own deliberate defect
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "boundaries.py", "."],
+                             capture_output=True, text=True)
+          assert r.returncode == 1, "the unwrapped outline() in inngest_impl went unflagged"
+          assert "inngest_impl/index.ts" in r.stdout, r.stdout
+          print("ground truth held")
+          PY
+      - name: every documented file exists
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          missing = []
+          for readme in ("README.md", "inngest_impl/README.md"):
+              body = open(readme).read()
+              for m in re.finditer(r"(?:npx tsx|python -m |python )([\w./_-]+)", body):
+                  ref = m.group(1)
+                  path = ref.replace(".", "/") + ".py" if ref.count("/") == 0 and "." not in ref else ref
+                  if ref.endswith(".ts") and not os.path.exists(ref):
+                      missing.append(f"{readme} -> {ref}")
+          print("checked README command targets")
+          assert not missing, "README names files that do not exist: " + ", ".join(missing)
+          PY
+      - name: run-demo.sh gives every implementation its own reset
+        run: |
+          python - <<'PY'
+          src = open("run-demo.sh").read()
+          for impl in ("langgraph", "dbos", "temporal", "inngest"):
+              block = src.split(f"  {impl})", 1)
+              assert len(block) == 2, f"{impl} has no case branch"
+              body = block[1].split(";;", 1)[0]
+              assert "RESET=" in body, f"{impl} does not declare its own RESET"
+          assert src.count("RESET=") >= 4, "fewer than four resets: one is shared again"
+          print("four implementations, four resets")
+          PY
       - name: probe.py imports nothing outside the stdlib
         run: |
           python - <<'PY'

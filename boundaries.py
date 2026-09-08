@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""Name every expensive call in your agent that a crash will make you pay for twice.
+
+    python boundaries.py my_agent/            # a package, a file, or a directory
+    python boundaries.py . --json             # machine-readable
+    python boundaries.py --self-test          # no arguments, no services, proves both directions
+
+Exit 0 = every expensive call sits behind its own durability boundary.
+Exit 1 = at least one does not, named, with the line.
+
+WHY THIS EXISTS
+probe.py answers the same question by killing a real run, which costs you four
+services, an API key and an afternoon. This reads the code you already have and
+answers it in a second. It is strictly weaker: it cannot see what your framework
+does at runtime, and it cannot price anything. It is also the version you will
+actually run before you ship.
+
+WHAT IT LOOKS FOR
+A durability boundary is whatever your framework checkpoints: a LangGraph node, a
+DBOS step, a Temporal Activity, an Inngest step.run(). Two failures matter.
+
+  UNPROTECTED  an expensive call your orchestrator reaches with no boundary in
+               between. Every retry buys it again, forever.
+  SHARED       one boundary holding several expensive calls. A crash inside it
+               repays all of them, so the boundary is coarser than the bill.
+
+Expensive means it costs money or wall time: a model call, an HTTP request, a
+paid API client. The list is in EXPENSIVE below and --expensive adds to it.
+
+WHAT IT CANNOT SEE
+Dynamic dispatch, calls through a variable the analysis cannot resolve, anything
+imported from a package it was not pointed at, and every framework not in
+FRAMEWORKS. It reports what it can prove and stays quiet about the rest, so a
+clean report is evidence and not a guarantee. TypeScript is read by pattern, not
+by parser, and is marked as such in the output.
+"""
+import argparse, ast, json, os, re, sys, tempfile, textwrap
+
+# --- what counts as expensive ------------------------------------------------
+# Attribute chains and bare names. Matched against the dotted source of the call,
+# so "openai" catches OpenAI().chat.completions.create through its receiver too.
+EXPENSIVE = [
+    "openai", "anthropic", "cohere", "mistralai", "groq", "together",
+    "chat.completions.create", "messages.create", "embeddings.create",
+    "responses.create", "images.generate", "audio.transcriptions.create",
+    "requests.get", "requests.post", "requests.put", "requests.delete",
+    "httpx.get", "httpx.post", "httpx.request", "aiohttp",
+    "boto3", "s3.upload", "s3.download", "bigquery", "stripe",
+    "invoke", "ainvoke", "predict", "generate_content",
+]
+
+# --- how each framework marks a boundary -------------------------------------
+# Each entry: the import that identifies it, decorator fragments that mark a
+# boundary, decorator fragments that mark an orchestrator, and the callable that
+# wraps a function into a boundary at runtime (DBOS.step(fn), ctx.run(fn)).
+#
+# The list is the product. A checker that knows four frameworks is a checker most
+# readers cannot run, so adding one is a data edit and never a code edit.
+FRAMEWORKS = {
+    "langgraph":  {"import": "langgraph", "boundary": [], "orchestrator": [],
+                   "register": ["add_node"], "name": "LangGraph node"},
+    "dbos":       {"import": "dbos", "boundary": ["dbos.step"],
+                   "orchestrator": ["dbos.workflow"], "register": [],
+                   "wrap": ["step"], "name": "@DBOS.step()"},
+    "temporal":   {"import": "temporalio", "boundary": ["activity.defn"],
+                   "orchestrator": ["workflow.defn"], "register": [],
+                   "name": "@activity.defn"},
+    "celery":     {"import": "celery", "boundary": ["shared_task", "app.task", ".task"],
+                   "orchestrator": ["chord", "chain"], "register": [],
+                   "name": "@app.task"},
+    "prefect":    {"import": "prefect", "boundary": ["task"], "orchestrator": ["flow"],
+                   "register": [], "name": "@task"},
+    "hatchet":    {"import": "hatchet_sdk", "boundary": ["hatchet.step", ".step"],
+                   "orchestrator": ["hatchet.workflow"], "register": [],
+                   "name": "@hatchet.step()"},
+    "airflow":    {"import": "airflow", "boundary": ["task"], "orchestrator": ["dag"],
+                   "register": [], "name": "@task"},
+    "restate":    {"import": "restate", "boundary": [], "orchestrator": ["handler"],
+                   "register": [], "ctx_run": ["ctx.run"], "name": "ctx.run()"},
+}
+
+# Frameworks whose durability lives in configuration rather than in your code, so
+# reading the source proves nothing. Named so a clean report cannot be mistaken for
+# coverage the checker does not have.
+CONFIG_ONLY = {
+    "aws step functions": "the state machine is JSON, not Python",
+    "cloudflare workflows": "steps are declared in the Worker binding",
+    "azure durable functions": "the orchestrator/activity split is in host.json",
+}
+
+def _dotted(node):
+    """Best-effort dotted source of a call target: OpenAI().chat.x -> openai.chat.x"""
+    parts = []
+    cur = node
+    while True:
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr); cur = cur.value
+        elif isinstance(cur, ast.Call):
+            cur = cur.func
+        elif isinstance(cur, ast.Name):
+            parts.append(cur.id); break
+        else:
+            break
+    return ".".join(reversed(parts)).lower()
+
+
+def _is_expensive(dotted, extra):
+    return any(term.lower() in dotted for term in EXPENSIVE + list(extra))
+
+
+def _decorators(fn):
+    return [_dotted(d) for d in fn.decorator_list]
+
+
+class FileScan:
+    """One Python file: its functions, what each calls, and which are boundaries."""
+
+    def __init__(self, path, src, extra):
+        self.path, self.extra = path, extra
+        self.tree = ast.parse(src, filename=path)
+        self.frameworks = set()
+        self.functions = {}        # name -> {"calls": [(callee, line)], "spend": [(dotted, line)], "node": fn}
+        self.boundaries = {}       # name -> why
+        self.orchestrators = {}    # name -> why
+        self.alias = {}            # local name -> original def name
+        self.imported = {}         # local name -> module it came from
+        self._imports()
+        self._functions()
+        self._boundaries()
+
+    def _imports(self):
+        for n in ast.walk(self.tree):
+            mods = []
+            if isinstance(n, ast.Import):
+                mods = [a.name for a in n.names]
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                mods = [n.module]
+            for m in mods:
+                for fw, spec in FRAMEWORKS.items():
+                    if m.split(".")[0] == spec["import"]:
+                        self.frameworks.add(fw)
+            # `from shared.agent import summarize as _summarize` renames the callee.
+            # Without this the call graph loses the edge and a bypassed boundary reads
+            # as clean, which is how this checker's own negative control caught it.
+            if isinstance(n, ast.ImportFrom) and n.module:
+                for a in n.names:
+                    local = a.asname or a.name
+                    self.alias[local] = a.name
+                    self.imported[local] = n.module
+            elif isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.asname:
+                        self.alias[a.asname] = a.name.split(".")[-1]
+
+    def _functions(self):
+        for fn in ast.walk(self.tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Loop context per call site. An unprotected call inside `for p in pages`
+            # is not repaid once, it is repaid once per page, and that multiplier is
+            # the difference between a rounding error and the whole bill.
+            loops = {}
+            for node in ast.walk(fn):
+                it = None
+                if isinstance(node, (ast.For, ast.AsyncFor)):
+                    it = node.iter
+                    body = list(node.body)
+                elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp,
+                                       ast.DictComp)):
+                    it = node.generators[0].iter if node.generators else None
+                    body = [node]
+                else:
+                    continue
+                label = _dotted(it) or "the collection"
+                for b in body:
+                    for inner in ast.walk(b):
+                        if isinstance(inner, ast.Call):
+                            loops.setdefault(inner.lineno, label)
+
+            calls, spend = [], []
+            for c in ast.walk(fn):
+                if not isinstance(c, ast.Call):
+                    continue
+                d = _dotted(c.func)
+                if not d:
+                    continue
+                if _is_expensive(d, self.extra):
+                    spend.append((d, c.lineno))
+                calls.append((d.split(".")[-1], c.lineno))
+            # One expression, one charge. `OpenAI().chat.completions.create(...)` is
+            # two Call nodes and one bill, so spends collapse by line.
+            by_line = {}
+            for d, line in spend:
+                by_line.setdefault(line, d)
+            self.functions[fn.name] = {"calls": calls,
+                                       "spend": sorted((d, ln) for ln, d in by_line.items()),
+                                       "node": fn, "line": fn.lineno, "loops": loops}
+
+    def _boundaries(self):
+        active = [FRAMEWORKS[f] for f in self.frameworks] or list(FRAMEWORKS.values())
+        b_marks = [m for spec in active for m in spec.get("boundary", [])]
+        o_marks = [m for spec in active for m in spec.get("orchestrator", [])]
+        registers = [m for spec in active for m in spec.get("register", [])]
+        wraps = [m for spec in active for m in spec.get("wrap", [])]
+        ctx_runs = [m for spec in active for m in spec.get("ctx_run", [])]
+
+        for name, info in self.functions.items():
+            for dec in _decorators(info["node"]):
+                for m in b_marks:
+                    if dec.endswith(m) or m in dec:
+                        self.boundaries.setdefault(name, f"@{dec}()")
+                for m in o_marks:
+                    if dec.endswith(m) or m in dec:
+                        self.orchestrators.setdefault(name, f"@{dec}()")
+        # An orchestrator marker wins over a boundary marker of the same word:
+        # Prefect and Airflow both spell a boundary `@task`, and Prefect spells the
+        # orchestrator `@flow`, so a function carrying both is the orchestrator.
+        for name in list(self.boundaries):
+            if name in self.orchestrators:
+                del self.boundaries[name]
+
+        # class-level orchestrator decorator: its methods orchestrate
+        for cls in ast.walk(self.tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            decs = [_dotted(x) for x in cls.decorator_list]
+            if any(m in d for d in decs for m in o_marks):
+                for mem in cls.body:
+                    if isinstance(mem, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        self.orchestrators[mem.name] = "@" + decs[0] + "()"
+
+        for c in ast.walk(self.tree):
+            if not isinstance(c, ast.Call):
+                continue
+            d = _dotted(c.func)
+            # LangGraph: add_node("x", fn) registers fn itself as the node body.
+            if any(d.endswith(r) for r in registers):
+                for arg in c.args:
+                    if isinstance(arg, ast.Name):
+                        self.boundaries[arg.id] = "add_node()"
+            # Restate: ctx.run("name", fn) is the boundary, like Inngest's step.run.
+            if any(d.endswith(r) for r in ctx_runs):
+                for arg in c.args:
+                    if isinstance(arg, ast.Name):
+                        self.boundaries[arg.id] = "ctx.run()"
+
+        # DBOS: `summarize_s = step(_summarize)` makes summarize_s the boundary and
+        # leaves _summarize callable and unprotected. Registering the ARGUMENT was
+        # this checker's own bug: it declared the bare function safe, so a workflow
+        # calling it directly read as clean. The target is the boundary; the argument
+        # only tells us what the target spends.
+        for assign in ast.walk(self.tree):
+            if not isinstance(assign, ast.Assign) or not wraps:
+                continue
+            targets = assign.targets[0]
+            names = ([e.id for e in targets.elts if isinstance(e, ast.Name)]
+                     if isinstance(targets, (ast.Tuple, ast.List))
+                     else ([targets.id] if isinstance(targets, ast.Name) else []))
+            values = (assign.value.elts if isinstance(assign.value, (ast.Tuple, ast.List))
+                      else [assign.value])
+            for tgt, val in zip(names, values):
+                if not (isinstance(val, ast.Call)
+                        and any(_dotted(val.func).endswith(w) for w in wraps)):
+                    continue
+                self.boundaries[tgt] = "DBOS.step()"
+                if val.args and isinstance(val.args[0], ast.Name):
+                    self.alias[tgt] = val.args[0].id
+
+
+def _resolve(name, alias):
+    """Follow an import alias back to the name the function was defined under."""
+    seen = set()
+    while name in alias and name not in seen:
+        seen.add(name); name = alias[name]
+    return name
+
+
+def _spend_map(scans, extra):
+    """function name -> True if calling it eventually spends money.
+
+    Fixed point over the whole scanned tree, so an orchestrator calling a helper
+    that calls the SDK is still seen as spending. This is what makes the checker
+    work on a repo where the expensive calls live in one shared module."""
+    direct = {}
+    edges = {}
+    for s in scans:
+        for name, info in s.functions.items():
+            direct[name] = bool(info["spend"])
+            edges.setdefault(name, set()).update(
+                _resolve(c, s.alias) for c, _ in info["calls"])
+    spends = {n for n, v in direct.items() if v}
+    changed = True
+    while changed:
+        changed = False
+        for name, callees in edges.items():
+            if name not in spends and (callees & spends):
+                spends.add(name); changed = True
+    return spends
+
+
+def check_python(paths, extra):
+    scans, findings = [], []
+    for p in paths:
+        try:
+            scans.append(FileScan(p, open(p, encoding="utf-8").read(), extra))
+        except SyntaxError as e:
+            findings.append({"kind": "SKIPPED", "file": p, "line": e.lineno or 0,
+                             "what": "could not parse", "why": str(e)})
+    spends = _spend_map(scans, extra)
+    # Boundaries stay LOCAL. `summarize_s = step(_summarize)` protects the name
+    # summarize_s and nothing else; resolving it through the alias chain marked
+    # _summarize protected too, and a workflow calling the bare function read as
+    # clean. Found by this checker's own negative control, twice.
+    # Anything called from a scanned file, imported from a module the scan never
+    # read, and not obviously stdlib. A clean report over a partial tree is not a
+    # clean repo, and saying so is the difference between evidence and comfort.
+    defined = {n for s in scans for n in s.functions}
+    unresolved = {}
+    for s in scans:
+        for name, info in s.functions.items():
+            for c, line in info["calls"]:
+                r = _resolve(c, s.alias)
+                if r in defined or c not in s.imported:
+                    continue
+                mod = s.imported[c].split(".")[0]
+                if mod in sys.stdlib_module_names or mod in {"typing", "dataclasses"}:
+                    continue
+                unresolved.setdefault((mod, c), (s.path, line))
+    for (mod, c), (path, line) in sorted(unresolved.items()):
+        findings.append({"kind": "UNREADABLE", "file": path, "line": line,
+                         "what": f"{c}() comes from {mod}, which this scan did not read",
+                         "why": "point the checker at that package too, or this report is "
+                                "silent about whatever it spends"})
+
+    for s in scans:
+        for name, info in s.functions.items():
+            in_boundary = name in s.boundaries
+            # SHARED: one boundary, several expensive calls
+            if in_boundary:
+                spend_lines = {ln for _, ln in info["spend"]}
+                reached = {(_resolve(c, s.alias), ln) for c, ln in info["calls"]
+                           if _resolve(c, s.alias) in spends and ln not in spend_lines}
+                n = len(info["spend"]) + len(reached)
+                if n > 1:
+                    findings.append({
+                        "kind": "SHARED", "file": s.path, "line": info["line"],
+                        "what": f"{name}() is one boundary ({s.boundaries[name]}) holding "
+                                f"{n} expensive calls",
+                        "why": "a crash inside it repays all of them, so the boundary is "
+                               "coarser than the bill"})
+                continue
+            # UNPROTECTED: an orchestrator spending outside any boundary
+            if name in s.orchestrators:
+                for raw, line in info["calls"]:
+                    if raw in s.boundaries:      # called through the wrapper: protected
+                        continue
+                    callee = _resolve(raw, s.alias)
+                    if callee in spends:
+                        per = info["loops"].get(line)
+                        findings.append({
+                            "kind": "UNPROTECTED", "file": s.path, "line": line,
+                            "per": per,
+                            "what": f"{name}() calls {raw}() with no boundary",
+                            "why": f"{s.orchestrators[name]} replays from the top, so this "
+                                   "is bought again on every retry"})
+                for d, line in info["spend"]:
+                    findings.append({
+                        "kind": "UNPROTECTED", "file": s.path, "line": line,
+                        "per": info["loops"].get(line),
+                        "what": f"{name}() calls {d} directly",
+                        "why": f"{s.orchestrators[name]} replays from the top, so this is "
+                               "bought again on every retry"})
+    return findings, sorted({fw for s in scans for fw in s.frameworks})
+
+
+# --- TypeScript, by pattern and honest about it ------------------------------
+TS_FN = re.compile(r"createFunction\s*\(", re.S)
+TS_STEP = re.compile(r"step\.run\s*\(\s*[`\"'][^`\"']*[`\"']\s*,\s*\(\)\s*=>\s*([A-Za-z_$][\w$]*)")
+TS_AWAIT = re.compile(r"(?<!step\.run\()\bawait\s+([A-Za-z_$][\w$]*)\s*\(")
+
+
+def check_typescript(paths):
+    findings = []
+    for p in paths:
+        src = open(p, encoding="utf-8").read()
+        if not TS_FN.search(src):
+            continue
+        wrapped = set(TS_STEP.findall(src))
+        for m in TS_AWAIT.finditer(src):
+            name = m.group(1)
+            if name in ("Promise", "fetch") or name in wrapped:
+                continue
+            # inside a step.run callback on the same line? then it is wrapped
+            line_start = src.rfind("\n", 0, m.start()) + 1
+            if "step.run" in src[line_start:m.start()]:
+                continue
+            findings.append({
+                "kind": "UNPROTECTED", "file": p,
+                "line": src[:m.start()].count("\n") + 1,
+                "what": f"await {name}() outside step.run()",
+                "why": "the function body re-runs once per step, so anything outside a "
+                       "step executes on every invocation"})
+    return findings
+
+
+def collect(target):
+    py, ts = [], []
+    if os.path.isfile(target):
+        (py if target.endswith(".py") else ts).append(target)
+        return py, ts
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if d not in
+                   {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}]
+        for f in files:
+            p = os.path.join(root, f)
+            if f.endswith(".py") and f != os.path.basename(__file__):
+                py.append(p)
+            elif f.endswith((".ts", ".tsx")):
+                ts.append(p)
+    return sorted(py), sorted(ts)
+
+
+def bill(findings, cost, fanout):
+    """What one crash costs, from what the source can prove.
+
+    Fixed sites are counted exactly. A site inside a loop is counted at `fanout`,
+    which the reader passes because the source cannot know how long the list is.
+    Both halves are printed, so nobody mistakes an assumption for a measurement."""
+    fixed = [f for f in findings if f["kind"] == "UNPROTECTED" and not f.get("per")]
+    looped = [f for f in findings if f["kind"] == "UNPROTECTED" and f.get("per")]
+    calls = len(fixed) + len(looped) * fanout
+    def plural(n, w):
+        return f"{n} {w}" + ("" if n == 1 else "s")
+
+    def money(x):
+        return f"${x:,.2f}" if x >= 0.01 else f"${x:.4f}"
+
+    lines = []
+    if looped:
+        terms = ", ".join(sorted({f"once per item in {f['per']}" for f in looped}))
+        lines.append(f"  every retry repays {plural(len(fixed), 'fixed call')} plus {terms}.")
+    elif fixed:
+        lines.append(f"  every retry repays {plural(len(fixed), 'call')}.")
+    if calls and cost is not None:
+        basis = (f"at {fanout} items per loop and {money(cost)} a call"
+                 if looped else f"at {money(cost)} a call")
+        lines.append(f"  {basis}, one crash repays {plural(calls, 'call')}, "
+                     f"{money(calls * cost)}. A thousand crashes: "
+                     f"{money(calls * cost * 1000)}.")
+    elif calls:
+        lines.append(f"  pass --cost to price it: {plural(calls, 'call')} per retry"
+                     + (f" at {fanout} items per loop" if looped else ""))
+    return lines
+
+
+def render(findings, frameworks, ts_count, root, cost=None, fanout=10):
+    if frameworks:
+        print(f"  frameworks seen: {', '.join(frameworks)}")
+    if ts_count:
+        print(f"  {ts_count} TypeScript file(s) read by pattern, not by parser: "
+              "treat those lines as a prompt to look, not a verdict")
+    print()
+    if not findings:
+        print("  every expensive call this could see sits behind its own boundary.")
+        print("  That is evidence, not a guarantee: read WHAT IT CANNOT SEE in the header.")
+        return 0
+    order = {"UNPROTECTED": 0, "SHARED": 1, "UNREADABLE": 2, "SKIPPED": 3}
+    for f in sorted(findings, key=lambda f: (order.get(f["kind"], 9), f["file"], f["line"])):
+        rel = os.path.relpath(f["file"], root)
+        print(f"  {f['kind']:<12} {rel}:{f['line']}")
+        print(f"               {f['what']}")
+        if f.get("per"):
+            print(f"               repaid once per item in {f['per']}, not once")
+        print(f"               {f['why']}")
+        print()
+    bad = [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")]
+    n_un = sum(1 for f in bad if f["kind"] == "UNPROTECTED")
+    n_sh = len(bad) - n_un
+    bits = []
+    if n_un:
+        bits.append(f"{n_un} call(s) your orchestrator buys again on every retry")
+    if n_sh:
+        bits.append(f"{n_sh} boundary(ies) holding more than one expensive call")
+    print("  " + ", ".join(bits) + ".")
+    for line in bill(findings, cost, fanout):
+        print(line)
+    return 1 if bad else 0
+
+
+# --- self-test ---------------------------------------------------------------
+GOOD = '''
+from dbos import DBOS
+from openai import OpenAI
+
+@DBOS.step()
+def summarize(page):
+    return OpenAI().chat.completions.create(model="gpt-4o-mini", messages=[])
+
+@DBOS.workflow()
+def research(pages):
+    return [summarize(p) for p in pages]
+'''
+
+UNPROTECTED = '''
+from dbos import DBOS
+from openai import OpenAI
+
+def summarize(page):
+    return OpenAI().chat.completions.create(model="gpt-4o-mini", messages=[])
+
+@DBOS.workflow()
+def research(pages):
+    return [summarize(p) for p in pages]
+'''
+
+SHARED = '''
+from dbos import DBOS
+from openai import OpenAI
+
+@DBOS.step()
+def summarize_and_outline(pages):
+    a = OpenAI().chat.completions.create(model="gpt-4o-mini", messages=[])
+    b = OpenAI().chat.completions.create(model="gpt-4o-mini", messages=[])
+    return a, b
+
+@DBOS.workflow()
+def research(pages):
+    return summarize_and_outline(pages)
+'''
+
+TS_CASE = '''
+import { Inngest } from "inngest"
+import { summarize, outline } from "./agent"
+export const inngest = new Inngest({ id: "x" })
+export const research = inngest.createFunction({ id: "r" }, { event: "e" },
+  async ({ event, step }) => {
+    const s = await step.run("summarize", () => summarize(event.data.page))
+    const o = await outline([s])
+    return o
+  })
+'''
+
+
+PREFECT = '''
+from prefect import flow, task
+from openai import OpenAI
+
+@task
+def summarize(page):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+
+def outline(s):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+
+@flow
+def research(pages):
+    return outline([summarize(p) for p in pages])
+'''
+
+CELERY = '''
+from celery import shared_task
+from openai import OpenAI
+
+@shared_task
+def summarize(page):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+'''
+
+FANOUT = '''
+from dbos import DBOS
+from openai import OpenAI
+
+def summarize(page):
+    return OpenAI().chat.completions.create(model="m", messages=[])
+
+@DBOS.workflow()
+def research(pages):
+    out = []
+    for p in pages:
+        out.append(summarize(p))
+    return out
+'''
+
+
+def self_test():
+    cases = [("a step around the model call", GOOD, 0, []),
+             ("the same call with no step", UNPROTECTED, 1, ["UNPROTECTED"]),
+             ("two model calls in one step", SHARED, 1, ["SHARED"]),
+             ("prefect: @task protects, a bare helper does not", PREFECT, 1, ["UNPROTECTED"]),
+             ("celery: @shared_task is a boundary", CELERY, 0, [])]
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        for label, src, want, kinds in cases:
+            p = os.path.join(d, "case.py")
+            open(p, "w").write(textwrap.dedent(src))
+            findings, fw = check_python([p], [])
+            got = 1 if [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")] else 0
+            seen = sorted({f["kind"] for f in findings})
+            good = got == want and all(k in seen for k in kinds)
+            ok &= good
+            print(f"  {'ok  ' if good else 'FAIL'}  {label}: exit {got} (wanted {want}), {seen}")
+        # the multiplier, which is the difference between a rounding error and a bill
+        p = os.path.join(d, "fanout.py")
+        open(p, "w").write(textwrap.dedent(FANOUT))
+        findings, _ = check_python([p], [])
+        per = [f.get("per") for f in findings if f["kind"] == "UNPROTECTED"]
+        good = per == ["pages"]
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  a call inside `for p in pages` is priced "
+              f"per item: {per}")
+        priced = bill(findings, 0.0004, 11)
+        good = any("11 calls" in l and "$0.0044" in l for l in priced)
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  the bill multiplies by --fanout: "
+              f"{priced[-1].strip() if priced else 'no bill'}")
+
+        p = os.path.join(d, "case.ts")
+        open(p, "w").write(textwrap.dedent(TS_CASE))
+        f = check_typescript([p])
+        good = any("outline" in x["what"] for x in f)
+        ok &= good
+        print(f"  {'ok  ' if good else 'FAIL'}  an await outside step.run() in TypeScript: "
+              f"{[x['what'] for x in f]}")
+    print("\nself-test PASS" if ok else "\nself-test FAIL")
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("target", nargs="?", default=".", help="file, directory or package")
+    ap.add_argument("--expensive", action="append", default=[],
+                    help="extra call fragment to treat as expensive; repeatable")
+    ap.add_argument("--cost", type=float, default=None, metavar="USD",
+                    help="price of one expensive call, so the report gives a bill instead "
+                         "of a count. gpt-4o-mini at a few hundred tokens is about 0.0004")
+    ap.add_argument("--fanout", type=int, default=10, metavar="N",
+                    help="items to assume in a loop the source cannot size (default 10)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+
+    py, ts = collect(a.target)
+    if not py and not ts:
+        print(f"  nothing to read under {a.target}")
+        return 0
+    findings, frameworks = check_python(py, a.expensive)
+    findings += check_typescript(ts)
+    if a.json:
+        print(json.dumps({"frameworks": frameworks, "findings": findings}, indent=1))
+        return 1 if [f for f in findings if f["kind"] in ("UNPROTECTED", "SHARED")] else 0
+    root = a.target if os.path.isdir(a.target) else os.path.dirname(a.target) or "."
+    return render(findings, frameworks, len(ts), root, a.cost, a.fanout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

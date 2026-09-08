@@ -3,20 +3,39 @@
 Every expensive call is wrapped in @probe so probe.py can count what actually
 re-executed after a crash. That decorator is the measurement, not the durability:
 the durability comes from whichever layer calls these functions.
+
+TWO LINES PER CALL, not one (2026-09-07). The old version logged once, on entry,
+so a process killed between the log and the API call counted as an execution that
+was never billed. This repo's whole claim is "work you bought twice", and an
+instrument that cannot tell an attempt from a charge cannot make it. `attempt`
+is written before the call, `completed` after it returns, and probe.py counts
+only the completed ones.
 """
 import json, os, time
 from dataclasses import dataclass
 
-LEDGER = os.environ.get("PROBE_LEDGER", "/tmp/probe-ledger.jsonl")
+# The pid keeps two runs on one machine out of each other's ledger. probe.py sets
+# PROBE_LEDGER explicitly, so this default only applies when you run an
+# implementation directly.
+LEDGER = os.environ.get("PROBE_LEDGER", f"/tmp/probe-ledger-{os.getpid()}.jsonl")
+
+
+def _write(step, phase):
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps({"step": step, "phase": phase, "t": time.time()}) + "\n")
 
 
 def probe(name):
-    """Append one line per ACTUAL execution. A memoized call never reaches this."""
+    """Append `attempt` before the call and `completed` after it returns.
+
+    A memoized call reaches neither. A killed call leaves an attempt with no
+    completion, which is exactly the partial work a crash throws away."""
     def wrap(fn):
         def inner(*a, **kw):
-            with open(LEDGER, "a") as f:
-                f.write(json.dumps({"step": name, "t": time.time()}) + "\n")
-            return fn(*a, **kw)
+            _write(name, "attempt")
+            out = fn(*a, **kw)
+            _write(name, "completed")
+            return out
         inner.__name__ = fn.__name__
         return inner
     return wrap

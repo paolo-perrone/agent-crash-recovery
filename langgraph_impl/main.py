@@ -5,6 +5,11 @@ persists in the background while the next node runs, so a hard crash can lose
 the newest checkpoint. On a forty-step agent that is the summary you were
 mid-way through paying for.
 
+It is an argument to invoke(), NOT to compile(), and it arrived in langgraph 1.0.
+This file passed it to compile() until 2026-09-07, where it is a TypeError on
+every published version: absent entirely in the 0.2.x line this repo used to pin,
+and on invoke() in 1.x. The README's first runnable command could not run.
+
 One node per expensive call. Put four calls in one node and a crash costs all four.
 """
 import argparse, os
@@ -55,7 +60,7 @@ def build(checkpointer):
     g.add_conditional_edges("summarize", more_pages, {"summarize": "summarize", "outline": "outline"})
     g.add_edge("outline", "publish")
     g.add_edge("publish", END)
-    return g.compile(checkpointer=checkpointer, durability="sync")
+    return g.compile(checkpointer=checkpointer)
 
 
 def main():
@@ -67,7 +72,8 @@ def main():
     with PostgresSaver.from_conn_string(os.environ["DATABASE_URL"]) as cp:
         cp.setup()
         out = build(cp).invoke({"query": a.query, "summaries": []},
-                               {"configurable": {"thread_id": a.thread}})
+                               {"configurable": {"thread_id": a.thread}},
+                               durability="sync")
     print(out["report"][:400])
 
 

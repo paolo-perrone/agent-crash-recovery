@@ -55,31 +55,64 @@ import argparse, collections, json, os, signal, subprocess, sys, tempfile, textw
 DEFAULT_LEDGER = "/tmp/probe-ledger.jsonl"
 
 
-def run_once(cmd, ledger, kill_after=None):
-    """Run cmd with PROBE_LEDGER=ledger. Returns ('killed'|'finished', seconds)."""
+def run_once(cmd, ledger, kill_after=None, kill_cmd=None):
+    """Run cmd with PROBE_LEDGER=ledger. Returns ('killed'|'finished', seconds, t0).
+
+    kill_cmd (2026-09-07) kills something OTHER than the process we started. Inngest
+    executes the function inside its own dev server, so SIGKILLing the client that
+    fired the event kills nothing under test and the probe reports a durability
+    finding about a process that was never doing the work."""
     open(ledger, "w").close()
     env = {**os.environ, "PROBE_LEDGER": ledger}
     t0 = time.time()
     p = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid, env=env)
     if kill_after:
         time.sleep(kill_after)
+        if kill_cmd:
+            subprocess.run(kill_cmd, shell=True, check=False)
+            if p.poll() is None:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            return "killed", time.time() - t0, t0
         if p.poll() is None:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)   # no cleanup, like a real eviction
-            return "killed", time.time() - t0
+            return "killed", time.time() - t0, t0
     p.wait()
-    return "finished", time.time() - t0
+    return "finished", time.time() - t0, t0
 
 
 def read(ledger):
-    """Counter of executions per step, plus the ordered list."""
+    """Counter of COMPLETED executions per step, plus the ordered list.
+
+    A row with no "phase" is an old-format ledger and counts as completed, so a
+    ledger written before 2026-09-07 still reads. An `attempt` with no matching
+    `completed` is work that was killed in flight: it cost time, it did not
+    necessarily cost money, and it is reported separately rather than counted."""
     try:
         rows = [json.loads(l) for l in open(ledger) if l.strip()]
     except FileNotFoundError:
         rows = []
-    return collections.Counter(r["step"] for r in rows), rows
+    done = collections.Counter(r["step"] for r in rows
+                               if r.get("phase", "completed") == "completed")
+    return done, rows
 
 
-def measure(cmd, kill_after, ledger_dir, reset=None):
+def unfinished(rows):
+    """(step, started_at) of the last attempt that never completed, or (None, None)."""
+    open_at = {}
+    last = (None, None)
+    for r in rows:
+        ph = r.get("phase", "completed")
+        if ph == "attempt":
+            open_at.setdefault(r["step"], []).append(r["t"])
+            last = (r["step"], r["t"])
+        elif open_at.get(r["step"]):
+            open_at[r["step"]].pop()
+            if last[0] == r["step"] and not open_at[r["step"]]:
+                last = (None, None)
+    return last
+
+
+def measure(cmd, kill_after, ledger_dir, reset=None, kill_cmd=None):
     def do_reset():
         if reset:
             subprocess.run(reset, shell=True, check=False)
@@ -89,7 +122,7 @@ def measure(cmd, kill_after, ledger_dir, reset=None):
     rest_l = os.path.join(ledger_dir, "restart.jsonl")
 
     do_reset()
-    state, base_secs = run_once(cmd, base_l, None)
+    state, base_secs, _ = run_once(cmd, base_l, None)
     if state == "killed":
         sys.exit("baseline run was killed; that should not happen")
     baseline, base_rows = read(base_l)
@@ -98,23 +131,31 @@ def measure(cmd, kill_after, ledger_dir, reset=None):
     print(f"  baseline    {base_secs:5.1f}s  {sum(baseline.values())} executions")
 
     do_reset()
-    state, _ = run_once(cmd, kill_l, kill_after)
+    state, _, kill_t0 = run_once(cmd, kill_l, kill_after, kill_cmd)
     if state == "finished":
         sys.exit(f"the run finished inside {kill_after}s; raise --kill-after "
                  f"(a clean run takes about {base_secs:.0f}s)")
     killed, kill_rows = read(kill_l)
-    interrupted = kill_rows[-1]["step"] if kill_rows else None
-    lost = kill_after - (kill_rows[-1]["t"] - kill_rows[0]["t"]) if len(kill_rows) > 1 else kill_after
+    # The in-flight step is the attempt with no completion, and `lost` is the time
+    # from when it started to the kill. The old version measured from the FIRST
+    # ledger row, so SDK imports and a Postgres connect were charged to it, which
+    # tripped the COARSE guard on systems that were drawing boundaries correctly.
+    interrupted, started_at = unfinished(kill_rows)
+    if interrupted is None:
+        interrupted = kill_rows[-1]["step"] if kill_rows else None
+        started_at = kill_rows[-1]["t"] if kill_rows else kill_t0
+    lost = (kill_t0 + kill_after) - started_at
+    working = (kill_t0 + kill_after) - (kill_rows[0]["t"] if kill_rows else kill_t0)
     print(f"  killed      {kill_after:5.1f}s  {sum(killed.values())} executions, "
           f"cut during '{interrupted}'")
 
     run_once(cmd, rest_l, None)
     restart, _ = read(rest_l)
     print(f"  restart            {sum(restart.values())} executions")
-    return baseline, killed, restart, interrupted, lost
+    return baseline, killed, restart, interrupted, lost, working
 
 
-def report(baseline, killed, restart, interrupted, lost, kill_after):
+def report(baseline, killed, restart, interrupted, lost, working):
     steps = sorted(set(baseline) | set(killed) | set(restart))
     repaid = {}
     print()
@@ -129,9 +170,11 @@ def report(baseline, killed, restart, interrupted, lost, kill_after):
     # The interrupted step's partial work is always lost. That is not a bug in the
     # system under test, but how MUCH of the run it represents is the verdict on
     # whether the boundary is drawn tightly enough to be worth anything.
-    swallowed = lost / kill_after if kill_after else 0
+    # Share of the time the run spent WORKING that sat inside one step. Startup is
+    # excluded: `working` starts at the first ledger row, not at process launch.
+    swallowed = (lost / working) if working else 0
     print(f"\n  '{interrupted}' was mid-flight at the kill: about {lost:.1f}s of "
-          f"partial work lost ({swallowed:.0%} of the time before the crash).")
+          f"partial work lost ({swallowed:.0%} of the time actually spent working).")
     # COARSE guards. These exist because "only the in-flight step was repaid" is
     # trivially true for a system with no boundaries at all: wrap everything in one
     # step and the kill lands inside it by definition. That is the exact hole the
@@ -164,13 +207,14 @@ def report(baseline, killed, restart, interrupted, lost, kill_after):
 SELF_TEST_COARSE = '''
 import json, os, time
 LEDGER = os.environ["PROBE_LEDGER"]
-def log(step):
+def log(step, phase):
     with open(LEDGER, "a") as f:
-        f.write(json.dumps({"step": step, "t": time.time()}) + "\\n")
+        f.write(json.dumps({"step": step, "phase": phase, "t": time.time()}) + "\\n")
 # One step wrapping the entire agent. Durable in the sense that it checkpoints,
 # but the boundary is so coarse that a crash anywhere repays everything.
-log("do_everything")
+log("do_everything", "attempt")
 time.sleep(3.6)
+log("do_everything", "completed")
 '''
 
 SELF_TEST_WORK = '''
@@ -178,16 +222,16 @@ import json, os, sys, time
 LEDGER = os.environ["PROBE_LEDGER"]
 STATE = os.environ["SELF_TEST_STATE"]
 DURABLE = os.environ["SELF_TEST_DURABLE"] == "1"
-def log(step):
+def log(step, phase):
     with open(LEDGER, "a") as f:
-        f.write(json.dumps({"step": step, "t": time.time()}) + "\\n")
+        f.write(json.dumps({"step": step, "phase": phase, "t": time.time()}) + "\\n")
 done = set()
 if DURABLE and os.path.exists(STATE):
     done = set(json.load(open(STATE)))
 def step(name, secs):
     if name in done:
         return
-    log(name); time.sleep(secs); done.add(name)
+    log(name, "attempt"); time.sleep(secs); log(name, "completed"); done.add(name)
     if DURABLE:
         json.dump(sorted(done), open(STATE, "w"))
 step("search", 0.6)
@@ -219,8 +263,8 @@ def self_test():
             print(f"\n--- {label} (expect exit {want})")
             sub = os.path.join(d, "ledgers-" + label.split()[0] + str(durable))
             os.makedirs(sub, exist_ok=True)
-            b, k, r, i, lost = measure(env_prefix, 1.6, sub, reset)
-            got = report(b, k, r, i, lost, 1.6)
+            b, k, r, i, lost, working = measure(env_prefix, 1.6, sub, reset)
+            got = report(b, k, r, i, lost, working)
             verdict = "PASS" if got == want else "FAIL"
             ok &= got == want
             print(f"  --> {verdict} (exit {got}, wanted {want})")
@@ -236,6 +280,10 @@ if __name__ == "__main__":
     p.add_argument("--reset", default=None,
                    help="shell command run before the baseline and before the killed run; "
                         "required against anything durable (see module docstring)")
+    p.add_argument("--kill-cmd", default=None,
+                   help="shell command that kills the SYSTEM UNDER TEST instead of the "
+                        "process we started. Required for anything that executes the work "
+                        "out of process, such as the Inngest dev server.")
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args()
     if a.self_test:
@@ -244,5 +292,5 @@ if __name__ == "__main__":
         p.error("--run is required (or use --self-test)")
     d = a.ledger_dir or tempfile.mkdtemp(prefix="probe-")
     os.makedirs(d, exist_ok=True)
-    b, k, r, i, lost = measure(a.run, a.kill_after, d, a.reset)
-    sys.exit(report(b, k, r, i, lost, a.kill_after))
+    b, k, r, i, lost, working = measure(a.run, a.kill_after, d, a.reset, a.kill_cmd)
+    sys.exit(report(b, k, r, i, lost, working))
