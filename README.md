@@ -207,6 +207,62 @@ This is a weaker test than the other three. Killing the served app leaves the de
 own run state intact, so what you are measuring is recovery of an app process rather than
 recovery from a lost node. Read the repaid table for Inngest as a floor, not a verdict.
 
+## First real runs, 2026-09-08
+
+Two of the four implementations have now been measured against live Postgres. The model
+call is stubbed (`PROBE_OFFLINE=1` swaps it for a sleep of the same shape), so these
+numbers are about DURABILITY and not about dollars: real checkpoints, a real SIGKILL, a
+real resume. What the crash costs in money still needs your own API key.
+
+**LangGraph**, `durability="sync"`, one node per page, 11 pages:
+
+```
+  step            once  killed  restart  repaid
+  outline            1       0        1      +0
+  publish            1       0        1      +0
+  search             1       1        0      +0
+  summarize         11       4        7      +0
+  nothing was repaid at all (the kill landed between steps)
+```
+
+**DBOS**, one `@DBOS.step()` per page, stable workflow id:
+
+```
+  step            once  killed  restart  repaid
+  outline            1       0        1      +0
+  publish            1       0        1      +0
+  search             1       1        0      +0
+  summarize         11       4        8      +1
+  only 'summarize' was repaid, which is the floor.
+```
+
+Four defects turned up in the first fifteen minutes of running these, and every one of them
+meant a path in this repo had never executed:
+
+1. **LangGraph re-ran the whole graph on resume.** `invoke()` was called with
+   `{"summaries": []}` a second time, which merges an empty list over the checkpoint. Resume
+   takes `None`. Cost before the fix: 4 summaries and a search bought twice.
+2. **DBOS never reached Postgres.** The config passed `system_database_url`, and
+   `DBOSConfig` on the pinned version has `database_url`. It is a TypedDict, so the wrong
+   key was accepted in silence and DBOS fell back to a passwordless default.
+3. **DBOS paid twice over.** Without a stable workflow id the restart recovered the
+   interrupted workflow AND started a fresh one: 23 executions against a 14-execution
+   baseline.
+4. **DBOS keeps its state in a separate database**, `durable_dbos_sys`, not in a `dbos`
+   schema inside your application database. The reset was dropping the schema, which cleared
+   nothing.
+5. **The Temporal healthcheck could never pass.** The server binds the container's IP and
+   the CLI defaults to `127.0.0.1:7233`, so `docker compose ps` reported the container
+   unhealthy while it was serving fine, and `run-demo.sh temporal` would have spun for two
+   minutes and declared a working server dead.
+
+**Temporal is not measured yet.** It runs end to end now, and `temporal_impl/run_once.sh`
+puts the worker and the starter in one process group so the probe's kill reaches the process
+doing the work. The three-run protocol still returns a restart of zero executions that has
+no explanation yet, so there is no Temporal number here rather than a number nobody checked.
+
+**Inngest is not measured either**, for the reason in "Measuring Inngest" above.
+
 ### What is not measured here
 
 `probe.py --self-test` and `test_probe.py` run in CI on every push. The four

@@ -28,7 +28,12 @@ services:
       POSTGRES_SEEDS: postgres
     ports: ["7233:7233"]
     healthcheck:
-      test: ["CMD", "temporal", "operator", "namespace", "describe", "default"]
+      # --address is required. The server binds the CONTAINER's IP, and the CLI
+      # defaults to 127.0.0.1:7233, so the obvious healthcheck can never pass and
+      # the container sits "unhealthy" forever while the server is fine
+      # (2026-09-08, first real run).
+      test: ["CMD", "temporal", "operator", "namespace", "describe",
+             "-n", "default", "--address", "temporal:7233"]
       interval: 5s
       retries: 20
 

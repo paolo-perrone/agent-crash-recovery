@@ -43,11 +43,12 @@ if [ "$IMPL" = "temporal" ]; then
   docker compose up -d temporal >/dev/null
   echo "  .. waiting for temporal (auto-setup takes ~30s on a cold start)"
   for _ in $(seq 1 60); do
-    docker compose exec -T temporal temporal operator namespace describe default \
-      >/dev/null 2>&1 && break
+    docker compose exec -T temporal temporal operator namespace describe \
+      -n default --address temporal:7233 >/dev/null 2>&1 && break
     sleep 2
   done
-  docker compose exec -T temporal temporal operator namespace describe default >/dev/null 2>&1 \
+  docker compose exec -T temporal temporal operator namespace describe \
+    -n default --address temporal:7233 >/dev/null 2>&1 \
     || die "temporal never came up. docker compose logs temporal"
   echo "  ok  temporal"
 fi
@@ -76,7 +77,11 @@ case "$IMPL" in
     # DBOS keeps workflow and step state in its own schema inside the system
     # database, so LangGraph's table list clears nothing here. Drop the schema and
     # DBOS.launch() rebuilds it.
-    RESET="$PSQL 'drop schema if exists dbos cascade'"
+    # DBOS keeps its state in a SEPARATE DATABASE, durable_dbos_sys, not in a dbos
+    # schema inside your app database (2026-09-08, first real run: dropping the
+    # schema cleared nothing, so the killed run resumed the baseline's finished
+    # workflow in milliseconds and the probe aborted).
+    RESET="docker compose exec -T postgres psql -U postgres -d postgres -q -c 'drop database if exists durable_dbos_sys with (force)'"
     CMD="python -m dbos_impl.main --query 'kv cache eviction'"
     echo "  .. dbos rebuilds its schema on launch, so the first run is a little slower";;
   temporal)
@@ -84,7 +89,7 @@ case "$IMPL" in
     # The reset terminates the previous run so the baseline starts clean, and the
     # id stays stable so the RESTART resumes instead of starting over.
     RESET="docker compose exec -T temporal temporal workflow terminate \
-      --workflow-id research-demo --reason probe-reset >/dev/null 2>&1 || true"
+      -w research-demo --address temporal:7233 --reason probe-reset >/dev/null 2>&1 || true"
     CMD="python -m temporal_impl.main --query 'kv cache eviction'"
     echo "  .. start the worker in another shell: python -m temporal_impl.worker";;
   inngest)

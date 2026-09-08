@@ -71,9 +71,16 @@ def main():
 
     with PostgresSaver.from_conn_string(os.environ["DATABASE_URL"]) as cp:
         cp.setup()
-        out = build(cp).invoke({"query": a.query, "summaries": []},
-                               {"configurable": {"thread_id": a.thread}},
-                               durability="sync")
+        graph = build(cp)
+        cfg = {"configurable": {"thread_id": a.thread}}
+        # RESUME WITH None, NOT WITH THE INPUT (2026-09-08, found on the first real
+        # run). Passing {"summaries": []} again merges an empty list over whatever
+        # the checkpoint holds, so every summary already paid for is thrown away and
+        # the resume re-executes the whole graph. The measured cost of getting this
+        # wrong was 4 summaries and a search bought twice on an 11-page run.
+        resuming = cp.get(cfg) is not None
+        out = graph.invoke(None if resuming else {"query": a.query, "summaries": []},
+                           cfg, durability="sync")
     print(out["report"][:400])
 
 

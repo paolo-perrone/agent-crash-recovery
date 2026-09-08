@@ -56,9 +56,24 @@ def search(query: str) -> list[Page]:
             for i in range(11)]
 
 
+# PROBE_OFFLINE=1 swaps the model call for a sleep of the same shape. Everything
+# that decides durability stays real: real Postgres, real checkpoints, a real
+# SIGKILL, a real resume. Only the HTTP call to OpenAI is stubbed, so the repaid
+# table can be produced without a key and without spending anything. The dollars
+# still need a key; the boundaries do not (2026-09-08).
+OFFLINE = os.environ.get("PROBE_OFFLINE") == "1"
+
+
+def _fake_model(seconds: float, label: str) -> str:
+    time.sleep(seconds)
+    return f"[offline {label}]"
+
+
 @probe("summarize")
 def summarize(page: Page) -> str:
     """The expensive one. This is the call a crash makes you buy twice."""
+    if OFFLINE:
+        return _fake_model(1.2, f"summary of {page.id}")
     from openai import OpenAI
     r = OpenAI().chat.completions.create(
         model="gpt-4o-mini", max_tokens=200,
@@ -69,6 +84,8 @@ def summarize(page: Page) -> str:
 
 @probe("outline")
 def outline(summaries: list[str]) -> str:
+    if OFFLINE:
+        return _fake_model(1.0, "outline")
     from openai import OpenAI
     r = OpenAI().chat.completions.create(
         model="gpt-4o-mini", max_tokens=400,
