@@ -27,15 +27,17 @@
 #   5. Inngest fans the summaries out with Promise.all, so a run that takes 15s in
 #      the sequential Python implementations takes about 5s here. KILL_AFTER has to
 #      be a few seconds, not eight.
-#   6. UNSOLVED: the three phases share one dev server and one queue, and a retry
-#      scheduled during one phase can execute during the next. A 2-second kill
-#      produced an empty baseline and 22 summarize in the restart, which is the
-#      baseline's own work arriving late.
+#   6. The three phases shared one dev server and one queue, so a retry scheduled
+#      during the baseline executed during the restart. A 2-second kill produced an
+#      empty baseline and 22 summarize in the restart, which was the baseline's own
+#      work arriving late. The baseline now gets its own dev server, torn down
+#      before the killed phase starts. Killed and restart still share one, because
+#      the restart resuming the killed run IS the measurement.
 #
-# Fixing 6 means a fresh dev server and a drained queue per phase, or reading the
-# run's step history from the dev server's API rather than counting executions in a
-# ledger. Until then there is no Inngest number, and an untrustworthy one is worse
-# than none.
+# KILL_AFTER has a narrow useful range here. Under about 2 seconds the kill lands
+# before search finishes and nothing is at risk; over about 5 the run is already
+# done. 3 to 4.5 puts it inside the fan-out, which is where the interesting answer
+# is.
 #
 # The app is started INLINE, never through command substitution. Capturing the PID
 # with $(...) returns the subshell's pid, the kill misses, and the app keeps writing
@@ -103,27 +105,42 @@ kill_app() {
   done
 }
 
-# The script owns the dev server too. Leaving it to another shell means the whole
-# measurement depends on a process nothing here can see, and a dev server that dies
-# mid-run looks exactly like a durability finding (2026-09-08).
+# ONE DEV SERVER PER INDEPENDENT PHASE. The baseline gets its own; killed and
+# restart SHARE one, because the restart resuming the killed run is the whole
+# measurement. Sharing all three let a retry scheduled during the baseline execute
+# during the restart, which produced an empty baseline and 22 summarize in the
+# restart on 2026-09-08. `inngest dev` defaults to --persist=false, so a fresh
+# process starts with an empty queue.
 DEV_PID=""
-if ! curl -sf -o /dev/null http://localhost:8288/health; then
+dev_up() {
+  dev_down
   npx --yes inngest-cli@latest dev -u http://localhost:3000/api/inngest --no-discovery \
-    >"$LEDGERS/dev.log" 2>&1 &
+    >>"$LEDGERS/dev.log" 2>&1 &
   DEV_PID=$!
   for _ in $(seq 1 60); do
-    curl -sf -o /dev/null http://localhost:8288/health && break
+    curl -sf -o /dev/null http://localhost:8288/health && return 0
     sleep 1
   done
-  curl -sf -o /dev/null http://localhost:8288/health || { echo "dev server never came up"; exit 1; }
-fi
+  echo "dev server never came up"; return 1
+}
+dev_down() {
+  [ -n "$DEV_PID" ] && { pkill -9 -P "$DEV_PID" 2>/dev/null; kill -9 "$DEV_PID" 2>/dev/null
+                         wait "$DEV_PID" 2>/dev/null; }
+  lsof -ti tcp:8288 -sTCP:LISTEN 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
+  DEV_PID=""
+  for _ in $(seq 1 20); do
+    curl -sf -o /dev/null http://localhost:8288/health || return 0
+    sleep 0.5
+  done
+}
 cleanup() {
-  [ -n "$DEV_PID" ] && kill -9 "$DEV_PID" 2>/dev/null
+  dev_down
   lsof -ti tcp:3000 -sTCP:LISTEN 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
 }
 trap cleanup EXIT
 
 echo "== baseline"
+dev_up || exit 1
 free_port
 PROBE_LEDGER="$LEDGERS/baseline.jsonl" PROBE_OFFLINE=1 INNGEST_DEV=1 \
   $TSX inngest_impl/serve.ts >"$LEDGERS/app-baseline.log" 2>&1 &
@@ -131,8 +148,10 @@ APP=$!
 wait_up "$APP" "$LEDGERS/app-baseline.log" || exit 1
 PROBE_OFFLINE=1 INNGEST_DEV=1 $TSX inngest_impl/fire.ts "kv cache eviction" >/dev/null 2>&1
 kill_app "$APP"
+dev_down
 
-echo "== killed"
+echo "== killed (a fresh dev server: the baseline's queue must not bleed in)"
+dev_up || exit 1
 free_port
 PROBE_LEDGER="$LEDGERS/killed.jsonl" PROBE_OFFLINE=1 INNGEST_DEV=1 \
   $TSX inngest_impl/serve.ts >"$LEDGERS/app-killed.log" 2>&1 &

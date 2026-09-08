@@ -277,36 +277,38 @@ Temporal executes activities in the WORKER and the probe kills only what it spaw
 writes the worker's output to a file: a worker that dies silently takes the measurement with
 it and leaves nothing to read, which cost a debugging round.
 
-**Inngest runs end to end now and is still not measured.** Four things had to be fixed
-before it would start at all, and every one meant the documented commands could not have
-worked:
+**Inngest**, `step.run()` per page, killed 4.5 seconds in:
 
-7. **There was no `package.json`.** Every `npx tsx inngest_impl/...` command in this repo
-   failed to resolve `inngest` and `openai`.
-8. **`serve.ts` imported `inngest/node`**, an adapter that does not exist before inngest 4.x.
-   On 3.x it dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
-9. **`index.ts` used the 3.x `createFunction` signature.** inngest 4.x takes the trigger
-   inside the first argument, so the function threw at import time.
-10. **`INNGEST_DEV=1` was in `.env.example` and nowhere else.** Without it the SDK runs in
-    cloud mode and refuses to serve without a signing key.
+```
+  step            once  killed  restart  repaid
+  outline            1       0        1      +0
+  publish            1       0        1      +0
+  search             1       1        0      +0
+  summarize         11       5        6      +0
+  worst repaid on any step: +0
+```
 
-`inngest_impl/measure.sh` measures it the way Inngest actually recovers: the dev server owns
-the run, your app is a callback target, and recovery happens when the APP comes back with no
-second event. It has produced a full 14-execution baseline by hand and not yet a trustworthy three-phase
-table. Five orchestration bugs were found and fixed on the way, all commented in the script,
-and one is unsolved: the three phases share one dev server and one queue, so a retry
-scheduled in one phase can execute during the next. A 2-second kill produced an empty
-baseline and 22 summarize in the restart, which is the baseline's own work arriving late.
+`search` completed before the crash and ran zero times on the resume: it was read back from
+the dev server's history. Five of the eleven summaries finished, and the resume paid for
+exactly the remaining six.
 
-Fixing it means a fresh dev server and a drained queue per phase, or reading the run's step
-history from the dev server's API rather than counting executions in a ledger. Until then
-there is no Inngest number, and an untrustworthy one is worse than none.
+Getting there took six orchestration fixes, all commented in `inngest_impl/measure.sh` where
+they were made. The last one is the interesting one:
 
-One thing the attempt did establish: **Inngest fans the summaries out with `Promise.all`,
-so a run that takes about 15 seconds in the sequential Python implementations takes about 5
-here.** Any kill window tuned on the others is too late for this one.
+11. **The three phases shared one dev server and one queue,** so a retry scheduled during
+    the baseline executed during the restart. A 2-second kill produced an empty baseline and
+    22 summarize in the restart, which was the baseline's own work arriving late. The
+    baseline now gets its own dev server and is torn down before the killed phase starts;
+    killed and restart share one, because the restart resuming the killed run is the entire
+    measurement. `inngest dev` defaults to `--persist=false`, so a fresh process is a clean
+    queue.
 
-Three of the four implementations are measured.
+**The deliberately unwrapped `outline()` does not show up in this table**, because the kill
+landed before it ran. Catching it this way needs a kill inside a window of a few hundred
+milliseconds in a five-second run. `boundaries.py` names it from the source in a second with
+nothing running, which is the argument for the static checker in one line.
+
+**All four implementations are measured.**
 
 ### What is not measured here
 
