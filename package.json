@@ -1,0 +1,19 @@
+{
+  "name": "agent-crash-recovery-inngest",
+  "private": true,
+  "type": "module",
+  "description": "The TypeScript half of the repo. There was no manifest until 2026-09-08, so every documented `npx tsx inngest_impl/...` command failed to resolve its imports. inngest is pinned at 4.20.0 because serve.ts imports inngest/node, and that adapter does not exist before 4.x: on 3.27.4 the server dies with ERR_PACKAGE_PATH_NOT_EXPORTED.",
+  "scripts": {
+    "serve": "tsx inngest_impl/serve.ts",
+    "fire": "tsx inngest_impl/fire.ts"
+  },
+  "dependencies": {
+    "inngest": "4.20.0",
+    "openai": "4.77.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.8.3"
+  }
+}

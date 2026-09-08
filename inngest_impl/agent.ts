@@ -3,7 +3,13 @@ import { appendFileSync } from "fs"
 import OpenAI from "openai"
 
 const LEDGER = process.env.PROBE_LEDGER ?? `/tmp/probe-ledger-${process.pid}.jsonl`
-const openai = new OpenAI()
+// PROBE_OFFLINE=1 swaps the model call for a sleep of the same shape, matching
+// shared/agent.py. Durability stays real; only the HTTP call is stubbed, so the
+// repaid table can be produced without a key.
+const OFFLINE = process.env.PROBE_OFFLINE === "1"
+const openai = OFFLINE ? (null as unknown as OpenAI) : new OpenAI()
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
  * `attempt` before the call, `completed` after it resolves. A memoized step reaches
@@ -33,6 +39,7 @@ export const search = (query: string): Promise<Page[]> =>
 
 export const summarize = (page: Page): Promise<string> =>
   probe("summarize", async () => {
+    if (OFFLINE) { await wait(1200); return `[offline summary of ${page.id}]` }
     const r = await openai.chat.completions.create({
       model: "gpt-4o-mini", max_tokens: 200,
       messages: [{ role: "user", content: `Summarize in two sentences:\n\n${page.text}` }],
@@ -42,6 +49,7 @@ export const summarize = (page: Page): Promise<string> =>
 
 export const outline = (summaries: string[]): Promise<string> =>
   probe("outline", async () => {
+    if (OFFLINE) { await wait(1000); return "[offline outline]" }
     const r = await openai.chat.completions.create({
       model: "gpt-4o-mini", max_tokens: 400,
       messages: [{ role: "user", content: "Outline a report from:\n\n" + summaries.join("\n") }],

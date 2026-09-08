@@ -49,6 +49,10 @@ jobs:
           assert "inngest_impl" in act[0]["file"], act[0]
           print("one finding, and it is the deliberate one")
           PY
+      - name: the TypeScript half type-checks
+        run: |
+          npm ci --silent
+          npx tsc --noEmit -p tsconfig.json || npx tsc --noEmit inngest_impl/*.ts
       - name: every documented file exists
         run: |
           python - <<'PY'

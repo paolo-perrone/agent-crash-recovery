@@ -12,13 +12,16 @@ import { search, summarize, outline, publish } from "./agent"
 
 export const inngest = new Inngest({ id: "durable-agents-four-ways" })
 
+// inngest 4.x takes the trigger INSIDE the first argument. The three-argument form
+// below was the 3.x API and throws at import time on 4.x, which is where the
+// documented serve command died on 2026-09-08.
 export const research = inngest.createFunction(
   {
     id: "research-agent",
+    triggers: [{ event: "research/requested" }],
     // flow control is configuration: five in-flight runs per tenant, no scheduler to write
     concurrency: { key: "event.data.tenantId", limit: 5 },
   },
-  { event: "research/requested" },
   async ({ event, step }) => {
     const pages = await step.run("search", () => search(event.data.query))
 

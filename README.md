@@ -277,7 +277,27 @@ Temporal executes activities in the WORKER and the probe kills only what it spaw
 writes the worker's output to a file: a worker that dies silently takes the measurement with
 it and leaves nothing to read, which cost a debugging round.
 
-**Inngest is still not measured**, for the reason in "Measuring Inngest" above. Three of four.
+**Inngest runs end to end now and is still not measured.** Four things had to be fixed
+before it would start at all, and every one meant the documented commands could not have
+worked:
+
+7. **There was no `package.json`.** Every `npx tsx inngest_impl/...` command in this repo
+   failed to resolve `inngest` and `openai`.
+8. **`serve.ts` imported `inngest/node`**, an adapter that does not exist before inngest 4.x.
+   On 3.x it dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+9. **`index.ts` used the 3.x `createFunction` signature.** inngest 4.x takes the trigger
+   inside the first argument, so the function threw at import time.
+10. **`INNGEST_DEV=1` was in `.env.example` and nowhere else.** Without it the SDK runs in
+    cloud mode and refuses to serve without a signing key.
+
+`inngest_impl/measure.sh` measures it the way Inngest actually recovers: the dev server owns
+the run, your app is a callback target, and recovery happens when the APP comes back with no
+second event. It has produced a full 14-execution baseline by hand but not yet a complete
+three-phase table, because the three-process dance (dev server, served app, event client)
+keeps losing one of the three between phases. That is an environment problem rather than a
+finding, and there is no Inngest number here until it runs clean.
+
+Three of the four implementations are measured.
 
 ### What is not measured here
 
